@@ -1,0 +1,16 @@
+# Configuración del entorno conda
+name: adcarla
+channels: [pytorch, nvidia, conda-forge]
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pyyaml
+  - opencv
+  - tensorboard
+  - matplotlib
+  - pytorch
+  - torchvision
+  - pytorch-cuda=12.1
+  - pip:
+      - carla==0.9.15   # Debe coincidir con la versión del servidor CARLA
