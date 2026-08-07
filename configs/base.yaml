@@ -1,0 +1,54 @@
+# Hiperparámetros comunes. Las otras configuraciones se basan en esta con `defaults: base.yaml`.
+seed: 0
+device: cuda
+
+carla:
+  host: localhost
+  port: 2000
+  town: Town10HD_Opt            # mapa CARLA v2
+  fixed_delta_seconds: 0.1      # 10 fps
+  timeout: 60.0                 # s para conectar/cargar el mapa
+  no_rendering: false           # renderizado activado (se necesita para las cámaras/LiDAR de los alumnos)
+  render_offscreen: true
+  quality: Epic
+
+action:
+  type: discrete
+  num_actions: 39               # estilo Raw2Drive (throttle/steer/brake discretizados)
+
+bev:
+  size: 128                     # rejilla BEV (Hb = Wb)
+  range_m: 50.0                 # cobertura (radio de la circunferencia en metros)
+  channels: 7                   # canales: road, route, ego, vehicle, pedestrian, light_green, light_red
+
+world_model:
+  deter_dim: 512                # h (GRU)
+  stoch_dim: 32                 # s: 32 variables categóricas...
+  stoch_classes: 32             # ...de 32 clases (32x32, DreamerV3)
+  hidden_dim: 512
+  embed_dim: 256                # dim del embedding del encoder que entra al RSSM
+  num_bins: 41                  # bins two-hot para reward/critic (espacio symlog)
+  free_bits: 1.0
+  kl_balance: 0.8
+
+policy:
+  horizon: 15                   # horizonte de imaginación
+  gamma: 0.997
+  lambda_: 0.95
+  actor_entropy: 3.0e-4
+
+reward:
+  w_progress: 1.0
+  w_collision: -1.0
+  w_infraction: -1.0
+  w_comfort: -0.1
+
+train:
+  batch_size: 16
+  seq_len: 50
+  lr: 3.0e-4
+  amp: true
+  grad_checkpoint: true
+  total_steps: 1000000
+  replay_capacity: 200000
+  log_dir: runs/
