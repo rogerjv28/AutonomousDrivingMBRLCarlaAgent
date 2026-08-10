@@ -39,12 +39,12 @@ class SensorSuite:
         self.config = config
         self.sensors_config = config.get("sensors", {})
         self._actors = []
-        self._latest = {}                 # TODO: ? nombre -> np.array
-        self.events = {"collision": False, "lane_invasion": False}
+        self._latest = {}   # diccionario última observación {nombre -> np.array}
+        self.events = {"collision": False, "lane_invasion": False}  # Flags colisión, invasión línea
 
         # Configuración cámaras
         bp = world.get_blueprint_library()
-        camera_height, camera_width = self.sensors_config.get("image_size", [256, 448]) # TODO: Por qué este estandard?
+        camera_height, camera_width = self.sensors_config.get("image_size", [256, 448])
         self._img_height_width = (int(camera_height), int(camera_width))
         self._setup_cameras(carla, bp)
 
@@ -82,7 +82,7 @@ class SensorSuite:
         lidar_bp = bp.find("sensor.lidar.ray_cast")
         lidar_bp.set_attribute("range", "50")
         lidar_bp.set_attribute("rotation_frequency", "10")
-        lidar_bp.set_attribute("channels", "32")    # TODO: 32 channels?
+        lidar_bp.set_attribute("channels", "32")    # Numero de lasers
         lidar_bp.set_attribute("points_per_second", "300000")
 
         # Creación

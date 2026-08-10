@@ -141,7 +141,7 @@ class CarlaEnv:
         self._last_speed = speed
         route_done = self._route_index >= len(self._route) - 2
 
-        signals = {"progress_m": progress, "collision": events["collision"],
+        signals = {"progress_meters": progress, "collision": events["collision"],
                    "infraction": events["lane_invasion"], "jerk": jerk, "route_done": route_done}
         reward, done, info = self.reward_fn(signals)
 
