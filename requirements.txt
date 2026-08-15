@@ -1,0 +1,9 @@
+# Lista de paquetes instalable con pip
+# pip install -r requirements.txt
+numpy
+pyyaml
+opencv-python
+tensorboard
+matplotlib
+carla==0.9.15
+light-the-torch
