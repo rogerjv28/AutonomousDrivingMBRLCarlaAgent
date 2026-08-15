@@ -4,9 +4,6 @@ Salida: array 3D float32 [C, H, W] con valores en {0,1}, ego en el centro, "dela
 C = Channel, H = Height, W = Width
 Estilo Think2Drive/Roach: cada canal es una capa semántica/un mapa binario con el que se marca si en esa
 coordenada existe o no el elemento del canal.
-
-Diseño para testeo: la geometría y el rasterizado son numpy puro (testeables sin CARLA);
-la extracción desde CARLA (`generate`) funciona a parte.
 """
 
 import math
@@ -24,14 +21,14 @@ class PrivilegedBEVGenerator:
         """Fija resolución y cobertura de la rejilla BEV a partir de cfg["bev"].
 
         Args:
-            cfg: configuración completa, se usa la clave "bev" (size, range_m) del diccionario.
+            cfg: configuración completa, se usa la clave "bev" (size, range_meters) del diccionario.
         """
         b = cfg.get("bev", {})
         self.size = int(b.get("size", 128))            # Height = Width
-        self.range_m = float(b.get("range_m", 50.0))   # semilado del área BEV cuadrada
+        self.range_meters = float(b.get("range_meters", 50.0))   # semilado del área BEV cuadrada
         self.channels = CHANNELS
         self.n_channels = len(CHANNELS)
-        self.mpp = (2.0 * self.range_m) / self.size    # metros por píxel
+        self.mpp = (2.0 * self.range_meters) / self.size    # metros por píxel
 
     ######################################################################
     #############################  GEOMETRÍA  ############################
@@ -82,9 +79,6 @@ class PrivilegedBEVGenerator:
         """Rasteriza (rellena) un polígono convexo sobre mask, dado en píxeles (col,row).
         Es decir, pinta polígonos con coordenadas del mundo en un canal BEV que es una grid binaria.
 
-        Test de semiplano por producto cruzado: un píxel está dentro si queda al mismo lado
-        de las K aristas del polígono. Vale para cualquier orden de giro (horario/antihorario).
-
         Args:
             mask: array (H, W), se modifica in-place. Mapa binario que define un canal BEV.
             poly_px: (K, 2) vértices consecutivos en píxeles (col, row). Esquinas de la figura
@@ -120,7 +114,10 @@ class PrivilegedBEVGenerator:
         px = gx.ravel().astype(np.float32)
         py = gy.ravel().astype(np.float32)
 
-        # Producto cruzado candidato-arista (una fila por arista, vectorizado sobre los candidatos)
+        # Producto cruzado punto candidato-arista (una fila por arista, vectorizado sobre los candidatos)
+        # para determinar de que lado de cada arista está el punto
+        # poly[(i + 1) % K] - poly[i]) || Vector de la arista (del vertice i al vertice i + 1)
+        # (py - poly[i]) || Vector del vertice i a un punto de la grid que hemos hecho en el paso anterior
         K = len(poly)
         cross = np.stack([
             (poly[(i + 1) % K, 0] - poly[i, 0]) * (py - poly[i, 1]) -
@@ -128,8 +125,166 @@ class PrivilegedBEVGenerator:
             for i in range(K)
         ], axis=0)
 
-        # Dentro del polígono = mismo signo (mismo lado) en todas las aristas a la vez
-        inside = np.all(cross >= -1e-6, axis=0) | np.all(cross <= 1e-6, axis=0)
-        idx = np.where(inside)[0]
-        mask[py[idx].astype(int), px[idx].astype(int)] = value
+        # Dentro del polígono = mismo signo (mismo lado) en relación a todas las aristas a la vez
+        points_inside_poly = np.all(cross >= -1e-6, axis=0) | np.all(cross <= 1e-6, axis=0) # array booleano de si los puntos de la grid están dentro
+        points_index = np.where(points_inside_poly)[0]  # index del array de los puntos que estan dentro del poligono
 
+        # Relleno en la máscara (mapa binario) de los puntos dentro del polígono
+        mask[py[points_index].astype(int), px[points_index].astype(int)] = value
+
+    def _draw_box(self, channel_mask, x, y, yaw, ex, ey, ego):
+        """Dibuja una caja orientada (mundo) sobre channel_mask: calcula esquinas, proyecta a BEV y rellena."""
+        corners = self.box_corners(x, y, yaw, ex, ey)
+        self._fill_convex(channel_mask, self.world_to_bev(corners, ego))
+
+    def _draw_polyline(self, channel_mask, pts_world, ego, thick=1.2):
+        """Dibuja una línea gruesa (la ruta) como quads entre puntos consecutivos."""
+        pts = np.asarray(pts_world, dtype=np.float32).reshape(-1, 2) # normaliza a un array (N,2), N puntos de ruta con sus 2 coordenadas (x,y)
+
+        # Iteramos sobre dos arrays de puntos consecutivos del polígono
+        for a, b in zip(pts[:-1], pts[1:]):
+            vector = b - a
+            norm = np.linalg.norm(vector) # norma euclídea
+
+            # Si la distancia es ínfima, saltamos la iteración
+            if norm < 1e-3:
+                continue
+
+            perpendicular = np.array([-vector[1], vector[0]]) / norm * thick # vector perpendicular del ancho deseado
+            quad = np.array([a + perpendicular, b + perpendicular, b - perpendicular, a - perpendicular], dtype=np.float32) # cuatro esquinas del rectángulo a pitnar
+
+            self._fill_convex(channel_mask, self.world_to_bev(quad, ego)) # pintamos el rectángulo
+
+    ######################################################################
+    ##############################  RENDER  ##############################
+    ######################################################################
+    def render(self, ego, actors=None, route_pts=None, lights=None, road_quads=None) -> np.ndarray:
+        """Construye representación BEV [C,H,W] a partir de datos YA extraídos (todo en coordenadas mundo).
+        
+        Args:
+            ego: posición vehículo ego | dict(x,y,yaw,ex,ey).
+            actors: actores del mundo carla, con su posicion y tipo | [dict(x,y,yaw,ex,ey,kind)].
+            route_pts: puntos de la ruta | [(x,y)].
+            lights: semáforos, con su posicion y estado | [dict(x,y,state)].
+            road_quads: rectángulos que forman la carretera | [(4,2) esquinas mundo].
+        """
+        mask_bev = np.zeros((self.n_channels, self.size, self.size), dtype=np.float32)  # array 3D lleno de zeros
+
+        # Pinta carreteras
+        for road_quad in (road_quads or []):
+            self._fill_convex(mask_bev[CHANNEL_INDEX["road"]], self.world_to_bev(road_quad, ego))
+
+        # Pinta la ruta
+        if route_pts is not None and len(route_pts) >= 2:
+            self._draw_polyline(mask_bev[CHANNEL_INDEX["route"]], route_pts, ego)
+
+        # Pinta el vehículo ego
+        self._draw_box(mask_bev[CHANNEL_INDEX["ego"]], ego["x"], ego["y"], ego["yaw"], ego["ex"], ego["ey"], ego)
+
+        # Pinta los actores (peatones y otros vehículos)
+        for actor in (actors or []):
+            channel = CHANNEL_INDEX["pedestrian"] if actor.get("kind") == "pedestrian" else CHANNEL_INDEX["vehicle"]
+            self._draw_box(mask_bev[channel], actor["x"], actor["y"], actor["yaw"], actor["ex"], actor["ey"], ego)
+
+        # Pinta los semáforos
+        for light in (lights or []):
+            channel = CHANNEL_INDEX["light_green"] if light.get("state") == "green" else CHANNEL_INDEX["light_red"]
+            self._draw_box(mask_bev[channel], light["x"], light["y"], 0.0, 1.0, 1.0, ego)
+
+        return mask_bev
+
+    ######################################################################
+    ####################### EXTRACCIÓN DESDE CARLA #######################
+    ######################################################################
+    def generate(self, world, ego_actor, route_pts=None) -> np.ndarray:
+        """Extrae actores/mapa/semáforos de CARLA alrededor del ego y llama a render()."""
+        import carla
+
+        ego_transform = ego_actor.get_transform()
+        ego_location = ego_transform.location
+        ego_bounding_box = ego_actor.bounding_box.extent
+        ego = {"x": ego_location.x, "y": ego_location.y, "yaw": ego_transform.rotation.yaw, "ex": ego_bounding_box.x, "ey": ego_bounding_box.y}
+
+        def near(location):
+            return abs(location.x - ego_location.x) <= self.range_meters and abs(location.y - ego_location.y) <= self.range_meters
+
+        # Guada los actores (coches y peatones) en un array
+        actors = []
+        for vehicle in world.get_actors().filter("vehicle.*"):
+            if vehicle.id == ego_actor.id:
+                continue
+
+            vehicle_transform = vehicle.get_transform()
+            if near(vehicle_transform.location):
+                vehicle_bounding_box = vehicle.bounding_box.extent
+                actors.append({"x": vehicle_transform.location.x, "y": vehicle_transform.location.y, "yaw": vehicle_transform.rotation.yaw,
+                               "ex": vehicle_bounding_box.x, "ey": vehicle_bounding_box.y, "kind": "vehicle"})
+
+        for pedestrian in world.get_actors().filter("walker.pedestrian.*"):
+            pedestrian_transform = pedestrian.get_transform()
+            if near(pedestrian_transform.location):
+                pedestrian_bounding_box = pedestrian.bounding_box.extent
+                actors.append({"x": pedestrian_transform.location.x, "y": pedestrian_transform.location.y, "yaw": pedestrian_transform.rotation.yaw,
+                               "ex": pedestrian_bounding_box.x, "ey": pedestrian_bounding_box.y, "kind": "pedestrian"})
+
+        # Guarda semáforos en un array
+        lights = []
+        for traffic_light in world.get_actors().filter("traffic.traffic_light*"):
+            light_transform = traffic_light.get_transform()
+            if near(light_transform.location):
+                traffic_light_state = str(traffic_light.get_state())
+                lights.append({"x": light_transform.location.x, "y": light_transform.location.y,
+                               "state": "green" if "Green" in traffic_light_state else "red"})
+
+        road_quads = self._road_quads(world.get_map(), ego_location)
+        route_world = [(p.x, p.y) for p in (route_pts or [])]
+
+        return self.render(ego, actors=actors, route_pts=route_world,
+                           lights=lights, road_quads=road_quads)
+
+    def _road_quads(self, carla_map, ego_location, step=2.0, max_waypoints=400):
+        """Aproxima la superficie de calzada: quads a lo largo de waypoints cercanos.
+        v1 sencilla (DFS acotado por next/left/right). TODO: cachear el mapa (estilo Roach)."""
+
+        import carla
+
+        start = carla_map.get_waypoint(ego_location)
+        if start is None:
+            return []
+
+        # Waypoints visitados, pila por tratar y lista de quads a devolver
+        seen, stack, quads = set(), [start], []
+        while stack and len(quads) < max_waypoints:
+            waypoint = stack.pop()
+            key = (round(waypoint.transform.location.x, 1), round(waypoint.transform.location.y, 1))    # se usan las coordenadas redondeadas como clave para identificar los waypoints
+            if key in seen:
+                continue
+
+            seen.add(key)
+            location = waypoint.transform.location
+            if abs(location.x - ego_location.x) > self.range_meters or abs(location.y - ego_location.y) > self.range_meters:    # comprovación de rango
+                continue
+
+            next_steps = waypoint.next(step)
+            if next_steps:
+                next = next_steps[0]
+                start = np.array([location.x, location.y])
+                end = np.array([next.transform.location.x, next.transform.location.y])
+
+                vector = end - start
+                norm = np.linalg.norm(vector)
+
+                # Si la distancia entre waypoints supera un mínimo, se calcula un vector perpendicular con el cual se calculan las cuatro esquinas
+                if norm > 1e-3:
+                    perpendicular = np.array([-vector[1], vector[0]]) / norm * (waypoint.lane_width / 2.0)
+                    quads.append(np.array([start + perpendicular, end + perpendicular, end - perpendicular, start - perpendicular], dtype=np.float32))
+
+                # Se guarda el waypoint siguiente en la pila para tratar
+                stack.append(next)
+
+            # Verifica si hay waypoints a lado y lado para añadirlos a la pila de waypoints a tratar
+            for neighbour_lane_waypoint in (waypoint.get_left_lane(), waypoint.get_right_lane()):
+                if neighbour_lane_waypoint is not None and neighbour_lane_waypoint.lane_type == carla.LaneType.Driving:
+                    stack.append(neighbour_lane_waypoint)
+
+        return quads
