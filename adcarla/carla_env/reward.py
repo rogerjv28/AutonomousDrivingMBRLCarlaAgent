@@ -3,8 +3,6 @@
 Función casi pura: recibe un dict de señales ya extraídas del simulador y devuelve
 (reward, done, info). Así es testeable sin CARLA.
 """
-from __future__ import annotations
-
 
 class RewardFunction:
     """Combina progreso, colisión, infracción y confort en una recompensa densa escalar."""
