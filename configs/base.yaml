@@ -18,7 +18,7 @@ action:
 
 bev:
   size: 128                     # rejilla BEV (Hb = Wb)
-  range_m: 50.0                 # cobertura; la mitad del lado del área cuadrada bev
+  range_meters: 50.0             # cobertura; la mitad del lado del área cuadrada bev
   channels: 7                   # canales: road, route, ego, vehicle, pedestrian, light_green, light_red
 
 world_model:
