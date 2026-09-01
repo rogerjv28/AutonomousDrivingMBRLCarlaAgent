@@ -66,7 +66,10 @@ def st_onehot_sample(logits: torch.Tensor) -> torch.Tensor:
 
 
 def categorical_kl_balance(post_logits, prior_logits, free_bits=1.0, balance=0.8):
-    """KL entre posterior y prior categóricos [B, S, C], con balancing y free bits. Devuelve [B].
+    """KL entre posterior y prior categóricos [..., S, C], con balancing y free bits. Devuelve [...].
+
+    La forma de salida coincide con la de entrada excepto las dos últimas dimensiones (S, C),
+    que se reducen con sum(-1): [B, S, C] → [B]; [B, T, S, C] → [B, T].
 
     KL balancing (DreamerV3): calcula el mismo KL dos veces cortando el gradiente hacia un lado
     cada vez, para ponderar por separado el ritmo al que se mueve el prior hacia el posterior y
@@ -76,11 +79,11 @@ def categorical_kl_balance(post_logits, prior_logits, free_bits=1.0, balance=0.8
     def kl(logits_a, logits_b):
         dist_a = torch.distributions.Categorical(logits=logits_a)
         dist_b = torch.distributions.Categorical(logits=logits_b)
-        return torch.distributions.kl_divergence(dist_a, dist_b).sum(-1)  # suma sobre S
+        # Clamp por variable antes de sumar (DreamerV3: "1 nat per latent dimension").
+        # Si se hace clamp después de la suma el floor efectivo sería free_bits/S veces más débil.
+        return torch.distributions.kl_divergence(dist_a, dist_b).clamp(min=free_bits).sum(-1)
 
     kl_prior = kl(post_logits.detach(), prior_logits)   # gradiente solo al prior
     kl_post = kl(post_logits, prior_logits.detach())    # gradiente solo al posterior
-    kl_prior = torch.clamp(kl_prior, min=free_bits)     # free bits: evita el colapso del posterior
-    kl_post = torch.clamp(kl_post, min=free_bits)
 
     return balance * kl_prior + (1.0 - balance) * kl_post

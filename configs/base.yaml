@@ -12,7 +12,7 @@ carla:
   render_offscreen: true        # renderizado activado (se necesita para las cámaras/LiDAR de los alumnos)
   quality: Epic
 
-action:
+action:                         # Config action no efectiva, solo para visualización
   type: discrete
   num_actions: 39               # estilo Raw2Drive (throttle/steer/brake discretizados)
 
@@ -49,6 +49,7 @@ train:
   lr: 3.0e-4
   amp: true
   grad_checkpoint: true
-  total_steps: 1000000
+  total_episodes: 5000        # ~1M pasos de entorno (episodios CARLA de ~200 pasos a 10fps); ajustar según GPU
   replay_capacity: 200000
+  automatic_checkpoint_episodes: 500   # episodios entre checkpoints periódicos intermedios
   log_dir: runs/

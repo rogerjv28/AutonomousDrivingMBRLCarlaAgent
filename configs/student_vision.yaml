@@ -5,7 +5,10 @@ encoder: bevformer
 sensors:
   cameras: [front, front_left, front_right]   # 1-3 cámaras (eficiencia)
   image_size: [256, 448]
-bevformer:
-  backbone: resnet18
-  num_layers: 3
-  temporal: false     # sin fusión temporal (eficiencia y comparacion con fusion)
+bevformer:                      # Backbone = CNN de 3 capas Conv2d+SiLU con 1 sola capa de spatial cross-attention
+  backbone: cnn_light           
+  backbone_channels: 64         # canales de salida del backbone de imagen
+  bev_channels: 128             # canales del mapa BEV interno
+  grid_size: 16                 # rejilla BEV del encoder (16x16)
+  num_heads: 4                  # cabezas de la spatial cross-attention
+  temporal: false               # atención temporal en el encoder no implementada

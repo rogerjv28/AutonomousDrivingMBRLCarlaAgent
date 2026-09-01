@@ -6,11 +6,15 @@ sensors:
   cameras: [front, front_left, front_right]
   image_size: [256, 448]
   lidar: true
-bevformer:                      # mismo encoder de cámara que la rama visión
-  backbone: resnet18
-  num_layers: 3
-  temporal: false
-fusion:
-  lidar: pointpillars
-  voxel_size: [0.2, 0.2, 8.0]   # voxel grueso (eficiencia)
-  fuser: conv                   # ConvFuser en BEV
+bevformer:                      # Backbone = CNN de 3 capas Conv2d+SiLU con 1 sola capa de spatial cross-attention
+  backbone: cnn_light
+  backbone_channels: 64         # canales de salida del backbone de imagen
+  bev_channels: 128             # canales del mapa BEV interno
+  grid_size: 16                 # rejilla BEV del encoder (16x16)
+  num_heads: 4                  # cabezas de la spatial cross-attention
+  temporal: false               # atención temporal en el encoder no implementada
+
+fusion:                         
+  lidar: rasterized_cnn         # LiDAR rasterizado a BEV (ocupacion + altura) + CNN de 2 capas
+  lidar_in_channels: 2          # canales del BEV de LiDAR: ocupacion, altura
+  fuser: conv                   # ConvFuser: concatena por canales y convoluciona (estilo BEVFusion)

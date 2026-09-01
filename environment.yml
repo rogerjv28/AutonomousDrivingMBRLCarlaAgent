@@ -2,12 +2,4 @@
 channels: [conda-forge]
 dependencies:
   - python=3.10
-  - pip
-  - numpy
-  - pyyaml
-  - opencv
-  - tensorboard
-  - matplotlib
-  - pip:
-      - carla==0.9.15
-      - light-the-torch
+  - pip=26.0.1
