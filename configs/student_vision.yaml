@@ -1,0 +1,11 @@
+defaults: base.yaml
+name: student_vision
+branch: vision
+encoder: bevformer
+sensors:
+  cameras: [front, front_left, front_right]   # 1-3 cámaras (eficiencia)
+  image_size: [256, 448]
+bevformer:
+  backbone: resnet18
+  num_layers: 3
+  temporal: false     # sin fusión temporal (eficiencia y comparacion con fusion)

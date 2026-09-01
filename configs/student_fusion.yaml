@@ -1,0 +1,16 @@
+defaults: base.yaml
+name: student_fusion
+branch: fusion
+encoder: fusion                 # BEVFormer (cámara, compartido) + rama LiDAR fusionada en BEV
+sensors:
+  cameras: [front, front_left, front_right]
+  image_size: [256, 448]
+  lidar: true
+bevformer:                      # mismo encoder de cámara que la rama visión
+  backbone: resnet18
+  num_layers: 3
+  temporal: false
+fusion:
+  lidar: pointpillars
+  voxel_size: [0.2, 0.2, 8.0]   # voxel grueso (eficiencia)
+  fuser: conv                   # ConvFuser en BEV
