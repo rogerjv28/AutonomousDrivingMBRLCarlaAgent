@@ -56,34 +56,46 @@ def two_hot_loss(logits: torch.Tensor, target: torch.Tensor, bins: torch.Tensor)
     return -(target_two_hot * log_probs).sum(-1)
 
 
+UNIMIX = 0.01
+
+
+def unimix_logits(logits: torch.Tensor, mix: float = UNIMIX) -> torch.Tensor:
+    """Mezcla la categórica con un `mix` de uniforme y devuelve los logits resultantes.
+
+    Técnica de robustez de DreamerV3: mezclar cada distribución categórica con el 1 % de
+    uniforme antes de muestrear y calcular KL, para evitar que colapse a cero probabilidad.
+    """
+    if not mix:
+        return logits
+    probs = torch.softmax(logits, -1)
+    probs = (1.0 - mix) * probs + mix / probs.shape[-1]
+    return torch.log(probs)
+
+
 def st_onehot_sample(logits: torch.Tensor) -> torch.Tensor:
-    """Muestra one-hot con straight-through. logits: [..., C]."""
-    dist = torch.distributions.OneHotCategorical(logits=logits)
+    """Muestrea one-hot con straight-through (con unimix). logits: [..., C]."""
+    dist = torch.distributions.OneHotCategorical(logits=unimix_logits(logits))
     sample = dist.sample()
-    # En valor da exactamente `sample` (sample + probs - probs = sample), pero al derivar
-    # probs.detach() no aporta gradiente, así que el gradiente fluye como si la salida fuera probs.
-    return sample + dist.probs - dist.probs.detach()
+    # `probs - probs.detach()` vale cero bit a bit, así que el resultado es `sample`,
+    # y al derivar el gradiente fluye como si la salida fuera probs. Los paréntesis importan:
+    # `(sample + probs) - probs` es el mismo valor en los reales pero no en float32 (daba
+    # 0.99999994 según la muestra, y hacía fallar el test de one-hot de forma intermitente).
+    return sample + (dist.probs - dist.probs.detach())
 
 
-def categorical_kl_balance(post_logits, prior_logits, free_bits=1.0, balance=0.8):
-    """KL entre posterior y prior categóricos [..., S, C], con balancing y free bits. Devuelve [...].
+def categorical_kl_balance(post_logits, prior_logits, free_bits=1.0, beta_dyn=1.0, beta_rep=0.1):
+    """Pérdidas de dinámica y representación de DreamerV3 (Ec. 2-3), combinadas.
 
     La forma de salida coincide con la de entrada excepto las dos últimas dimensiones (S, C),
     que se reducen con sum(-1): [B, S, C] → [B]; [B, T, S, C] → [B, T].
-
-    KL balancing (DreamerV3): calcula el mismo KL dos veces cortando el gradiente hacia un lado
-    cada vez, para ponderar por separado el ritmo al que se mueve el prior hacia el posterior y
-    viceversa (si no, el optimizador tiende a colapsar el posterior hacia el prior).
     """
 
-    def kl(logits_a, logits_b):
-        dist_a = torch.distributions.Categorical(logits=logits_a)
-        dist_b = torch.distributions.Categorical(logits=logits_b)
-        # Clamp por variable antes de sumar (DreamerV3: "1 nat per latent dimension").
-        # Si se hace clamp después de la suma el floor efectivo sería free_bits/S veces más débil.
-        return torch.distributions.kl_divergence(dist_a, dist_b).clamp(min=free_bits).sum(-1)
+    def kl_total(logits_a, logits_b):
+        dist_a = torch.distributions.Categorical(logits=unimix_logits(logits_a))
+        dist_b = torch.distributions.Categorical(logits=unimix_logits(logits_b))
+        return torch.distributions.kl_divergence(dist_a, dist_b).sum(-1).clamp(min=free_bits)
 
-    kl_prior = kl(post_logits.detach(), prior_logits)   # gradiente solo al prior
-    kl_post = kl(post_logits, prior_logits.detach())    # gradiente solo al posterior
+    kl_dyn = kl_total(post_logits.detach(), prior_logits)   # gradiente solo al prior
+    kl_rep = kl_total(post_logits, prior_logits.detach())   # gradiente solo al posterior
 
-    return balance * kl_prior + (1.0 - balance) * kl_post
+    return beta_dyn * kl_dyn + beta_rep * kl_rep
