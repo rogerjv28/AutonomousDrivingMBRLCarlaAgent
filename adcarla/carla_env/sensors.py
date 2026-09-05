@@ -1,12 +1,45 @@
 """SensorSuite: monta y lee los sensores de CARLA para el vehículo ego.
 
-Cada sensor registra un callback que guarda la ÚLTIMA lectura, `get_obs()` las recoge.
-Depende de CARLA (import perezoso).
+Cámaras y LiDAR encolan sus lecturas crudas en una `queue.Queue` por sensor (el callback
+solo hace `put`); `get_frame()` empareja por frame exacto (`data.frame`) como Roach/carla_garage,
+para no mezclar en una misma observación datos de dos frames simulados distintos.
 
 Convención de cámaras: nombres -> transform (x, y, z, yaw) respecto al ego.
 """
 
+import queue
+import time
+
 import numpy as np
+
+# Tipos de marca vial que sí penaliza lane_invasion. Nombres de carla.LaneMarkingType.
+SOLID_LANE_MARKINGS = {"Solid", "SolidSolid"}
+
+
+# Clasificación del actor impactado para el Infraction Penalty del Leaderboard: el
+# coeficiente depende de contra qué se choca (peatón 0.50, vehículo 0.60, estático 0.65).
+COLLISION_PREFIX = {"walker": "pedestrian", "vehicle": "vehicle"}
+
+
+def _collision_type(event):
+    """Traduce `event.other_actor.type_id` a "pedestrian"/"vehicle"/"static".
+
+    Devuelve None si el evento no trae un actor utilizable (el DS lo tratará como estático,
+    el coeficiente más suave de los tres; ver adcarla/carla_env/metrics.py).
+    """
+    type_id = getattr(getattr(event, "other_actor", None), "type_id", None)
+    if not type_id:
+        return None
+    return COLLISION_PREFIX.get(str(type_id).split(".")[0], "static")
+
+
+def _is_solid_lane_mark(lane_marking) -> bool:
+    """Compara el tipo de marca por su nombre, no por el enum de carla (duck typing): así se
+    puede fakear en tests sin importar carla, pasando cualquier objeto con `.type` o un string."""
+    tipo = getattr(lane_marking, "type", lane_marking)
+    nombre = getattr(tipo, "name", tipo)
+    return str(nombre) in SOLID_LANE_MARKINGS
+
 
 # Colocación aproximada de cámaras (metros, grados). Ajustable.
 CAMERA_TRANSFORMS = {
@@ -20,7 +53,7 @@ CAMERA_TRANSFORMS = {
 
 
 class SensorSuite:
-    """Monta cámaras/LiDAR/colisión/invasión de línea en el ego y expone sus últimas lecturas."""
+    """Monta cámaras/LiDAR/colisión/invasión de línea en el ego y expone sus lecturas por frame."""
 
     def __init__(self, world, ego, config: dict):
         """Crea y adjunta al ego los sensores indicados en config["sensors"].
@@ -29,7 +62,11 @@ class SensorSuite:
             world: carla.World donde se spawnean los sensores.
             ego: actor vehículo al que se adjuntan los sensores.
             config: diccionario de configuración con la clave "sensors" (cameras,
-                lidar, image_size).
+                lidar, image_size). Sin cámaras configuradas no se monta ninguna: es el caso
+                del profesor, que solo consume la máscara BEV privilegiada.
+
+        Raises:
+            RuntimeError: si hay cámaras configuradas pero falta "sensors.image_size".
         """
         import carla
 
@@ -38,21 +75,38 @@ class SensorSuite:
         self.ego = ego
         self.config = config
         self.sensors_config = config.get("sensors", {})
+        self.camera_names = list(self.sensors_config.get("cameras", []))
         self._actors = []
-        self._latest = {}   # diccionario última observación {nombre -> np.array}
-        self.events = {"collision": False, "lane_invasion": False}  # Flags colisión, invasión línea
+        self._queues = {}   # nombre de sensor (camara o lidar) -> Queue de lecturas crudas
+        # Flags de colisión e invasión de línea, más el tipo del actor impactado.
+        self.events = {"collision": False, "lane_invasion": False, "collision_type": None}
 
-        # Configuración cámaras
-        bp = world.get_blueprint_library()
-        camera_height, camera_width = self.sensors_config.get("image_size", [256, 448])
-        self._img_height_width = (int(camera_height), int(camera_width))
-        self._setup_cameras(carla, bp)
+        # Cadena _setup_cameras -> _setup_lidar -> _setup_events: si un paso posterior falla
+        # tras haber spawneado ya sensores, hay que destruirlos antes de propagar la excepción
+        # (si no, __init__ no termina, self.sensors se queda en None en env.py y esos sensores
+        # ya spawneados quedan huérfanos, emitiendo el resto del proceso.
+        try:
+            bp = world.get_blueprint_library()
+            if self.camera_names:
+                if "image_size" not in self.sensors_config:
+                    raise RuntimeError(
+                        "SensorSuite: falta 'sensors.image_size' en el config. La resolución de captura "
+                        "la fija el YAML ([160, 288] en los alumnos), no el código: capturar a otra "
+                        "resolución cambia el numero de tokens de la spatial cross-attention.")
+                camera_height, camera_width = self.sensors_config["image_size"]
+                self._img_height_width = (int(camera_height), int(camera_width))
+                self._setup_cameras(carla, bp)
 
-        # Configuración LiDAR
-        if self.sensors_config.get("lidar", False):
-            self._setup_lidar(carla, bp)
-        
-        self._setup_events(carla, bp)
+            if self.sensors_config.get("lidar", False):
+                self._setup_lidar(carla, bp)
+
+            self._setup_events(carla, bp)
+        except Exception:
+            try:
+                self.destroy()
+            except Exception:
+                pass   # la excepcion de la limpieza no debe enmascarar la original
+            raise
 
     # ---- SETUP ----
     def _cam_transform(self, carla, camera_name):
@@ -71,9 +125,11 @@ class SensorSuite:
         cam_bp.set_attribute("fov", "90")
 
         # Creación
-        for camera_name in self.sensors_config.get("cameras", ["front"]):
+        for camera_name in self.camera_names:
+            q = queue.Queue()
+            self._queues[camera_name] = q
             sensor = self.world.spawn_actor(cam_bp, self._cam_transform(carla, camera_name), attach_to=self.ego)
-            sensor.listen(lambda data, name=camera_name: self._on_camera(data, name))
+            sensor.listen(q.put)  # el callback solo encola: decodificar aqui reintroduciria la carrera
             self._actors.append(sensor)
 
     def _setup_lidar(self, carla, bp):
@@ -86,9 +142,14 @@ class SensorSuite:
         lidar_bp.set_attribute("points_per_second", "300000")
 
         # Creación
+        # z = 1.8 m: es la referencia de Z_MIN/Z_MAX en encoders/fusion/lidar_branch.py, que
+        # normaliza la altura del raster BEV respecto al sensor. Cambiar una cosa sin la otra
+        # desplaza todo el canal de altura.
         transform = carla.Transform(carla.Location(x=0.0, z=1.8))
+        q = queue.Queue()
+        self._queues["lidar"] = q
         sensor = self.world.spawn_actor(lidar_bp, transform, attach_to=self.ego)
-        sensor.listen(lambda data: self._on_lidar(data))
+        sensor.listen(q.put)
         self._actors.append(sensor)
 
     def _setup_events(self, carla, bp):
@@ -96,41 +157,102 @@ class SensorSuite:
         # Sensor de colisión (para la función reward)
         collision_sensor = self.world.spawn_actor(bp.find("sensor.other.collision"),
                                      carla.Transform(), attach_to=self.ego)
-        collision_sensor.listen(lambda e: self.events.__setitem__("collision", True))
+        collision_sensor.listen(self._on_collision)
 
         # Sensor de invasión de línia (para la función reward)
         lane_sensor = self.world.spawn_actor(bp.find("sensor.other.lane_invasion"),
                                       carla.Transform(), attach_to=self.ego)
-        lane_sensor.listen(lambda e: self.events.__setitem__("lane_invasion", True))
+        lane_sensor.listen(self._on_lane_invasion)
 
         self._actors += [collision_sensor, lane_sensor]
 
-    # ---- CALLBACKS ----
-    def _on_camera(self, image, camera_name):
-        """Callback de carla.Sensor: decodifica el frame BGRA y lo guarda en RGB como última lectura."""
-        arr = np.frombuffer(image.raw_data, dtype=np.uint8)
-        arr = arr.reshape((image.height, image.width, 4))[:, :, :3] # BGRA -> BGR, descarta Alpha (transparencia)
-        self._latest[camera_name] = arr[:, :, ::-1].copy() # BGR -> RGB, alterna el orden porque las otras librerias tratan imágenes como RGB
+    def _on_collision(self, event):
+        """Marca la colisión y clasifica el actor impactado. Si en el mismo tick hay varios
+        choques se conserva el primero: el episodio termina en la colisión, así que el segundo
+        no llega a puntuar."""
+        if not self.events["collision"]:
+            self.events["collision_type"] = _collision_type(event)
+        self.events["collision"] = True
 
-    def _on_lidar(self, data):
-        """Callback de carla.Sensor: decodifica la nube de puntos (x, y, z, intensity)."""
-        pts = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4)  # x,y,z,intensity (coordenadas y intensidad que sirve como medida de que tan lejos está el punto)
-        self._latest["lidar"] = pts.copy()
+    def _on_lane_invasion(self, event):
+        """Solo cuenta como infracción cruzar una marca continua: una discontinua es
+        un cambio de carril legal, no una infracción."""
+        marks = getattr(event, "crossed_lane_markings", [])
+        if any(_is_solid_lane_mark(mark) for mark in marks):
+            self.events["lane_invasion"] = True
+
+    # ---- DECODIFICACIÓN ----
+    @staticmethod
+    def _decode_camera(image):
+        """Decodifica el frame BGRA de carla.Image a un array RGB (copia, sin canal alfa)."""
+        arr = np.frombuffer(image.raw_data, dtype=np.uint8)
+        arr = arr.reshape((image.height, image.width, 4))[:, :, :3]  # BGRA -> BGR, descarta Alpha
+        return arr[:, :, ::-1].copy()  # BGR -> RGB, alterna el orden porque las otras librerias tratan imágenes como RGB
+
+    @staticmethod
+    def _decode_lidar(data):
+        """Decodifica la nube de puntos (x, y, z, intensity) de carla.LidarMeasurement."""
+        pts = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4)
+        return pts.copy()
 
     # ---- API ----
-    def get_obs(self) -> dict:
-        """Última observación disponible: {"cameras": {nombre_camera: array}, "lidar": array opcional}."""
-        cams = {name: self._latest.get(name) for name in self.sensors_config.get("cameras", ["front"])}
+    def _wait_for_frame(self, name: str, frame: int, timeout: float):
+        """Descarta lecturas de la cola `name` hasta encontrar `data.frame == frame`.
+
+        Descarta tanto frames atrasados como cualquier otro que no coincida (por si llegasen
+        desordenados), sin bloquear más allá de `timeout` en total.
+
+        Raises:
+            TimeoutError: si el frame pedido no llega dentro de `timeout` segundos.
+        """
+        q = self._queues[name]
+        deadline = time.monotonic() + timeout
+        while True:
+            restante = deadline - time.monotonic()
+            if restante <= 0:
+                raise TimeoutError(
+                    f"SensorSuite: el sensor '{name}' no entrego el frame {frame} en {timeout}s")
+            try:
+                data = q.get(timeout=restante)
+            except queue.Empty:
+                raise TimeoutError(
+                    f"SensorSuite: el sensor '{name}' no entrego el frame {frame} en {timeout}s")
+            if data.frame == frame:
+                return data
+            # frame distinto del pedido (atrasado o desordenado): se descarta y se sigue buscando
+
+    def get_frame(self, frame: int, timeout: float = 2.0) -> dict:
+        """Observación con TODOS los sensores emparejados exactamente al mismo `frame` simulado.
+
+        Args:
+            frame: frame de simulación a buscar (world.get_snapshot().frame tras el tick).
+            timeout: segundos máximos de espera por sensor.
+
+        Returns:
+            {"cameras": {nombre: array RGB}, "lidar": array [N, 4] opcional}, ya decodificado.
+        """
+        cams = {name: self._decode_camera(self._wait_for_frame(name, frame, timeout))
+                for name in self.camera_names}
         obs = {"cameras": cams}
-        if self.sensors_config.get("lidar", False):
-            obs["lidar"] = self._latest.get("lidar")
+        if "lidar" in self._queues:
+            obs["lidar"] = self._decode_lidar(self._wait_for_frame("lidar", frame, timeout))
         return obs
+
+    def clear_queues(self):
+        """Vacía todas las colas sin bloquear (usado tras el calentamiento de `reset()`)."""
+        for q in self._queues.values():
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
 
     def pop_events(self) -> dict:
         """Devuelve los eventos (colisión, invasión de línea) acumulados y resetea los flags."""
         ev = dict(self.events)
         self.events["collision"] = False
         self.events["lane_invasion"] = False
+        self.events["collision_type"] = None
         return ev
 
     def destroy(self):

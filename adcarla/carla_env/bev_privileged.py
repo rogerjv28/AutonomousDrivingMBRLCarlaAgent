@@ -52,10 +52,10 @@ class PrivilegedBEVGenerator:
         dx = pts[:, 0] - ego["x"]
         dy = pts[:, 1] - ego["y"]
         yaw_rad = math.radians(ego["yaw"])
-        cosinus, sinus = math.cos(yaw_rad), math.sin(yaw_rad)
+        cos_yaw_rad, sin_yaw_rad = math.cos(yaw_rad), math.sin(yaw_rad)
 
-        fx = dx * cosinus + dy * sinus          # eje x -> longitudinal
-        fy = -dx * sinus + dy * cosinus         # eje y -> lateral
+        fx = dx * cos_yaw_rad + dy * sin_yaw_rad          # eje x -> longitudinal
+        fy = -dx * sin_yaw_rad + dy * cos_yaw_rad         # eje y -> lateral
         col = self.size / 2.0 + fy / self.mpp
         row = self.size / 2.0 - fx / self.mpp   # delante = hacia arriba (row menor)
 
@@ -66,12 +66,12 @@ class PrivilegedBEVGenerator:
         """Devuelve las 4 esquinas (mundo) de una caja centrada en (x,y), con inclinación yaw (grados) y
         la mitad de la longitud de sus lados(ex,ey)."""
         yaw_rad = math.radians(yaw_deg)
-        cosinus, sinus = math.cos(yaw_rad), math.sin(yaw_rad)
+        cos_yaw_rad, sin_yaw_rad = math.cos(yaw_rad), math.sin(yaw_rad)
 
-        corners = np.array([[ex, ey], [ex, -ey], [-ex, -ey], [-ex, ey]], dtype=np.float32)    #  4 esquinas de un rectángulo centrado en el origen (0,0), sin rotar
-        R = np.array([[cosinus, -sinus], [sinus, cosinus]], dtype=np.float32)   # matriz de rotación 2D
+        corners = np.array([[ex, ey], [ex, -ey], [-ex, -ey], [-ex, ey]], dtype=np.float32)    # 4 esquinas de un rectángulo centrado en el origen (0,0), sin rotar
+        rotation_matrix = np.array([[cos_yaw_rad, -sin_yaw_rad], [sin_yaw_rad, cos_yaw_rad]], dtype=np.float32)   # matriz de rotación 2D
 
-        corners_rotated = corners @ R.T     # rotación de las cuatro esquinas centradas en (0,0)
+        corners_rotated = corners @ rotation_matrix.T     # rotación de las cuatro esquinas centradas en (0,0)
 
         return corners_rotated + np.array([x, y], dtype=np.float32)     # translación de las cuatro esquinas alrededor del punto (x,y)
 
@@ -243,48 +243,80 @@ class PrivilegedBEVGenerator:
                            lights=lights, road_quads=road_quads)
 
     def _road_quads(self, carla_map, ego_location, step=2.0, max_waypoints=400):
-        """Aproxima la superficie de calzada: quads a lo largo de waypoints cercanos.
-        v1 sencilla (DFS acotado por next/left/right). TODO: cachear el mapa (estilo Roach)."""
+        """Quads de la superficie de calzada alrededor del ego.
 
+        La calzada es estática: no cambia dentro de un episodio ni entre episodios del mismo
+        mapa. Se precalcula una vez por mapa y se indexa por celdas (estilo
+        Roach, que rasteriza el mapa entero al cargarlo), el tick solo consulta las celdas vecinas.
+        """
+        cache = _road_quad_cache(carla_map, step)
+
+        return cache.near(ego_location.x, ego_location.y, self.range_meters, max_waypoints)
+
+
+_ROAD_QUAD_CACHES = {}
+ROAD_CELL_METERS = 25.0   # lado de la celda del índice espacial de la caché de calzada
+
+
+def _road_quad_cache(carla_map, step: float):
+    """Devuelve (creándola la primera vez) la caché de calzada del mapa, compartida por proceso."""
+    clave = (getattr(carla_map, "name", None) or id(carla_map), step)
+    if clave not in _ROAD_QUAD_CACHES:
+        _ROAD_QUAD_CACHES[clave] = RoadQuadCache(carla_map, step)
+
+    return _ROAD_QUAD_CACHES[clave]
+
+
+class RoadQuadCache:
+    """Quads de calzada de un mapa entero, calculados una vez e indexados por celdas."""
+
+    def __init__(self, carla_map, step: float = 2.0, cell_meters: float = ROAD_CELL_METERS):
+        """Muestrea todos los carriles conducibles del mapa y reparte sus quads en celdas.
+
+        Args:
+            carla_map: objeto devuelto por `world.get_map()`.
+            step: separación entre waypoints, y también la longitud de cada quad.
+            cell_meters: lado de la celda del índice espacial.
+        """
         import carla
 
-        start = carla_map.get_waypoint(ego_location)
-        if start is None:
-            return []
+        self.cell_meters = float(cell_meters)
+        self.tiles = {}
+        half_length = step / 2.0
 
-        # Waypoints visitados, pila por tratar y lista de quads a devolver
-        seen, stack, quads = set(), [start], []
-        while stack and len(quads) < max_waypoints:
-            waypoint = stack.pop()
-            key = (round(waypoint.transform.location.x, 1), round(waypoint.transform.location.y, 1))    # se usan las coordenadas redondeadas como clave para identificar los waypoints
-            if key in seen:
+        for waypoint in carla_map.generate_waypoints(step):
+            if waypoint.lane_type != carla.LaneType.Driving:
                 continue
 
-            seen.add(key)
-            location = waypoint.transform.location
-            if abs(location.x - ego_location.x) > self.range_meters or abs(location.y - ego_location.y) > self.range_meters:    # comprovación de rango
-                continue
+            transform = waypoint.transform
+            x, y = transform.location.x, transform.location.y
+            # Quad centrado en el waypoint (largada `step`, anchura del carril) en vez de
+            # waypoint->next(): misma cobertura y sin una llamada más a CARLA por waypoint.
+            quad = PrivilegedBEVGenerator.box_corners(x, y, transform.rotation.yaw,
+                                                      half_length, waypoint.lane_width / 2.0)
+            self.tiles.setdefault(self._key(x, y), []).append((x, y, quad))
 
-            next_steps = waypoint.next(step)
-            if next_steps:
-                next = next_steps[0]
-                start = np.array([location.x, location.y])
-                end = np.array([next.transform.location.x, next.transform.location.y])
+    def _key(self, x: float, y: float):
+        return (int(math.floor(x / self.cell_meters)), int(math.floor(y / self.cell_meters)))
 
-                vector = end - start
-                norm = np.linalg.norm(vector)
+    def near(self, x: float, y: float, range_meters: float, max_quads: int) -> list:
+        """Quads cuyo centro cae en el cuadrado de semilado `range_meters` alrededor de (x, y).
 
-                # Si la distancia entre waypoints supera un mínimo, se calcula un vector perpendicular con el cual se calculan las cuatro esquinas
-                if norm > 1e-3:
-                    perpendicular = np.array([-vector[1], vector[0]]) / norm * (waypoint.lane_width / 2.0)
-                    quads.append(np.array([start + perpendicular, end + perpendicular, end - perpendicular, start - perpendicular], dtype=np.float32))
+        Las celdas se recorren de más cerca a más lejos, así que si se alcanza `max_quads` lo
+        que se descarta es siempre lo más lejano.
+        """
+        radio = int(math.ceil(range_meters / self.cell_meters))
+        cx, cy = self._key(x, y)
+        celdas = [(i, j) for i in range(cx - radio, cx + radio + 1)
+                  for j in range(cy - radio, cy + radio + 1)]
+        celdas.sort(key=lambda c: (c[0] - cx) ** 2 + (c[1] - cy) ** 2)
 
-                # Se guarda el waypoint siguiente en la pila para tratar
-                stack.append(next)
-
-            # Verifica si hay waypoints a lado y lado para añadirlos a la pila de waypoints a tratar
-            for neighbour_lane_waypoint in (waypoint.get_left_lane(), waypoint.get_right_lane()):
-                if neighbour_lane_waypoint is not None and neighbour_lane_waypoint.lane_type == carla.LaneType.Driving:
-                    stack.append(neighbour_lane_waypoint)
+        quads = []
+        for celda in celdas:
+            for qx, qy, quad in self.tiles.get(celda, ()):
+                if abs(qx - x) <= range_meters and abs(qy - y) <= range_meters:
+                    quads.append(quad)
+                    if len(quads) >= max_quads:
+                        return quads
 
         return quads
