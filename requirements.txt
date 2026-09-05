@@ -1,9 +1,10 @@
 # Lista de paquetes instalable con pip
 # pip install -r requirements.txt
 numpy
+scipy>=1.7          # IC 95 % (t de Student) y Mann-Whitney U, >=1.7 por method="exact"
 pyyaml
 opencv-python
 tensorboard
-matplotlib
 carla==0.9.15
-light-the-torch
+light-the-torch     # torch se instala con `ltt install torch`, hace falta >=2.4 por nn.RMSNorm
+pytest

@@ -1,5 +1,6 @@
 __pycache__/
+adcarla.egg-info/
 checkpoints/
 data/
-adcarla.egg-info
+runs/
 .vscode/
