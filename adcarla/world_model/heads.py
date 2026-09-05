@@ -1,6 +1,7 @@
 """Heads del world model: Decoder (reconstruye la máscara BEV), RewardHead (two-hot), ContinueHead."""
 import torch
 import torch.nn as nn
+from adcarla.utils.norms import RMSNorm
 
 class Decoder(nn.Module):
     """Reconstruye la máscara BEV privilegiada a partir del estado latente (feat -> [B, bev_channels, H, W]).
@@ -44,13 +45,12 @@ class Decoder(nn.Module):
             feat: vector de características latentes [B, feat_dim].
 
         Returns:
-            Mapa BEV reconstruido [B, bev_channels, size, size], valores en [0, 1].
+            Logits del mapa BEV [B, bev_channels, size, size] (sin sigmoid), la pérdida los
+            consume con `F.binary_cross_entropy_with_logits`.
         """
         # Proyecta a tensor espacial y reformatea para las ConvTranspose
         x = self.to_spatial(feat).view(-1, self.base_channels, self.initial_size, self.initial_size)
-
-        # Normalizamos los valores a (0, 1)
-        return torch.sigmoid(self.net(x))
+        return self.net(x)   # logits crudos, sigmoid lo aplica la función de pérdida
 
 
 class RewardHead(nn.Module):
@@ -73,7 +73,7 @@ class RewardHead(nn.Module):
         # Una capa linear hacia la hidden layer con activación SiLU y
         # una capa que proyecta hacia el numero de bins marcado.
         self.net = nn.Sequential(
-            nn.Linear(feat_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(feat_dim, hidden_dim), RMSNorm(hidden_dim), nn.SiLU(),
             nn.Linear(hidden_dim, num_bins)
         )
 
@@ -108,7 +108,7 @@ class ContinueHead(nn.Module):
         # Una capa linear hacia la hidden layer con activación SiLU y
         # una capa que proyecta a un número la probabilidad de continuación.
         self.net = nn.Sequential(
-            nn.Linear(feat_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(feat_dim, hidden_dim), RMSNorm(hidden_dim), nn.SiLU(),
             nn.Linear(hidden_dim, 1)
         )
 
