@@ -27,7 +27,7 @@ class SpatialCrossAttention(nn.Module):
         # Capa linear para transformar la dimensión de los tokens de entrada a la representación bev intermedia
         self.token_projection = nn.Linear(token_dim, bev_channels)
 
-        # 
+        # Módulo de cross-attention: cada query BEV atiende a todos los tokens proyectados de imagen
         self.cross_attention = nn.MultiheadAttention(bev_channels, num_heads, batch_first=True)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:

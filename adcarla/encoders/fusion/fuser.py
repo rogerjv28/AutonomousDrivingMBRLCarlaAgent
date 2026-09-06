@@ -37,5 +37,10 @@ class ConvFuser(nn.Module):
         Returns:
             Mapa BEV fusionado, forma [K, bev_channels, G, G].
         """
+        if camera_bev.shape != lidar_bev.shape:
+            raise RuntimeError(
+                f"ConvFuser.forward(): camera_bev y lidar_bev deben tener la misma forma; "
+                f"recibidas {tuple(camera_bev.shape)} y {tuple(lidar_bev.shape)}"
+            )
         # Concatena por canales -> [K, 2*bev_channels, H, W] y pasa por las convoluciones.
         return self.net(torch.cat([camera_bev, lidar_bev], dim=1))

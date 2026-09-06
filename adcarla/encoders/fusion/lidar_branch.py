@@ -4,6 +4,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# Rango vertical util del LiDAR, en metros relativos al sensor: del suelo a la altura de un camion.
+# Depende de la z de montaje del LiDAR, que fija carla_env/sensors.py (_setup_lidar, z=1.8): con
+# esos 1.8 m, [-2.0, 2.5] cubre de bajo el suelo a 4.3 m de altura real. Si cambia ahi, cambiar aqui.
+Z_MIN, Z_MAX = -2.0, 2.5
+# Centinela de celda sin puntos: una altura real normalizada nunca es negativa, asi que la
+# CNN puede distinguir "vacio" de "objeto a ras de suelo" (con 0 ambos casos eran el mismo valor).
+EMPTY_HEIGHT = -1.0
+# rasterize() siempre produce estos 2 canales (ocupacion + altura): estan fijados en su codigo,
+# no leen ningun config. Si in_channels no coincide, __init__ lo rechaza.
+RASTERIZE_CHANNELS = 2
+
 
 class LiDARBranch(nn.Module):
     """CNN sobre el LiDAR ya rasterizado a BEV -> mapa BEV de características (para fusionar con la cámara)."""
@@ -19,6 +30,17 @@ class LiDARBranch(nn.Module):
         """
         super().__init__()
         self.grid_size = grid_size
+
+        # rasterize() esta fijado a RASTERIZE_CHANNELS (ocupacion + altura).
+        # Un in_channels distinto (p.ej. desde fusion.lidar_in_channels del YAML) haria fallar el
+        # primer forward por shapes. Se detecta aqui, al construir, con un mensaje claro.
+        if in_channels != RASTERIZE_CHANNELS:
+            raise RuntimeError(
+                f"LiDARBranch: in_channels={in_channels} no coincide con los "
+                f"{RASTERIZE_CHANNELS} canales que produce LiDARBranch.rasterize() "
+                "(ocupación + altura). Ajusta fusion.lidar_in_channels en el config "
+                "o adapta rasterize() para que produzca ese número de canales."
+            )
 
         # 2 capas convolucionales con la función de activación Sigmoid Linear Unit y
         # una capa de pooling que hace la media para cada celda de la rejilla BEV.
@@ -37,6 +59,8 @@ class LiDARBranch(nn.Module):
         Returns:
             [K, bev_channels, grid_size, grid_size] - mapa BEV de características del LiDAR.
         """
+        if "lidar_bev" not in inputs:
+            raise RuntimeError("LiDARBranch.forward() requiere la clave 'lidar_bev' en inputs")
         return self.net(inputs["lidar_bev"])    # [K, bev_channels, grid_size, grid_size]
 
     @staticmethod
@@ -44,7 +68,8 @@ class LiDARBranch(nn.Module):
         """Convierte una nube de puntos LiDAR en un histograma BEV de 2 canales.
 
         Por cada píxel: canal 0 = ocupación (1 si hay algún punto ahí), canal 1 = altura (z)
-        máxima de los puntos que caen en esa celda.
+        máxima de los puntos que caen en esa celda, normalizada a [0, 1] sobre [Z_MIN, Z_MAX];
+        las celdas sin puntos se quedan en el centinela EMPTY_HEIGHT = -1.
 
         Args:
             lidar_points: (N, 4) puntos (x, y, z, intensity) en metros, relativos al sensor/ego.
@@ -52,11 +77,11 @@ class LiDARBranch(nn.Module):
             range_meters: cobertura, mitad del lado del área cuadrada representada (metros).
 
         Returns:
-            [2, size, size] float32: canal 0 ocupación, canal 1 altura máxima.
+            [2, size, size] float32: canal 0 ocupación, canal 1 altura máxima normalizada.
         """
         # 2 canales de la representación BEV
         occupancy = np.zeros((size, size), np.float32)
-        height_max = np.zeros((size, size), np.float32)
+        height_max = np.full((size, size), EMPTY_HEIGHT, np.float32)
 
         if lidar_points is None or len(lidar_points) == 0:
             return np.stack([occupancy, height_max], 0)
@@ -72,6 +97,9 @@ class LiDARBranch(nn.Module):
 
         occupancy[cy, cx] = 1.0 # escribe el valor 1 en las celdas ocupadas de la rejilla BEV occupancy
 
-        np.maximum.at(height_max, (cy, cx), z)  # escribe la altura máxima correspondiente a las celdas de ocupación en las celdas de la rejilla BEV height_max
+        # Normaliza z al rango util del sensor antes de acumular: la CNN recibe alturas en la
+        # misma escala que el canal de ocupación, y el maximo se conserva (la normalización es monótona).
+        z_norm = np.clip((z - Z_MIN) / (Z_MAX - Z_MIN), 0.0, 1.0).astype(np.float32)
+        np.maximum.at(height_max, (cy, cx), z_norm)  # altura máxima de los puntos de cada celda
 
         return np.stack([occupancy, height_max], 0) # devuelve los dos canales BEV
