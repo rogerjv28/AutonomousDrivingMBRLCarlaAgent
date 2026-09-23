@@ -1,0 +1,3 @@
+defaults: base.yaml
+name: teacher
+encoder: privileged     # entrada = máscara BEV semántica (Etapa 1)
