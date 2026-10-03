@@ -6,8 +6,12 @@ Estilo Think2Drive/Roach: cada canal es una capa semántica/un mapa binario con 
 coordenada existe o no el elemento del canal.
 """
 
+import logging
 import math
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Canales de la máscara (el orden define el índice). len(CHANNELS) = bev.channels.
 CHANNELS = ["road", "route", "ego", "vehicle", "pedestrian", "light_green", "light_red"]
@@ -197,44 +201,73 @@ class PrivilegedBEVGenerator:
     ####################### EXTRACCIÓN DESDE CARLA #######################
     ######################################################################
     def generate(self, world, ego_actor, route_pts=None) -> np.ndarray:
-        """Extrae actores/mapa/semáforos de CARLA alrededor del ego y llama a render()."""
+        """Extrae actores/mapa/semáforos de CARLA alrededor del ego y llama a render().
+
+        Cada acceso a un actor de fondo (transform, bounding_box, estado) va dentro de `try/except`.
+        El `is_alive` de la línea de arriba puede ser cierto y el actor morir antes de la siguiente
+        llamada y una excepción del cliente de CARLA sobre un actor ya destruido tumbaría el
+        `step()` entero por un NPC. El ego es distinto, si falla, no hay máscara BEV que generar, así
+        que se propaga como `RuntimeError` para que el caller (`CarlaEnv._build_obs`, envuelto en
+        `_safe_ego_call`) termine el episodio.
+        """
         import carla
 
-        ego_transform = ego_actor.get_transform()
-        ego_location = ego_transform.location
-        ego_bounding_box = ego_actor.bounding_box.extent
+        try:
+            ego_transform = ego_actor.get_transform()
+            ego_location = ego_transform.location
+            ego_bounding_box = ego_actor.bounding_box.extent
+        except Exception as e:
+            raise RuntimeError("PrivilegedBEVGenerator: el ego ya no es un actor válido") from e
         ego = {"x": ego_location.x, "y": ego_location.y, "yaw": ego_transform.rotation.yaw, "ex": ego_bounding_box.x, "ey": ego_bounding_box.y}
 
         def near(location):
             return abs(location.x - ego_location.x) <= self.range_meters and abs(location.y - ego_location.y) <= self.range_meters
 
-        # Guada los actores (coches y peatones) en un array
+        # Una sola llamada a CARLA por la lista completa de actores. Los .filter() posteriores son
+        # filtrado local en este código Python sobre esa lista, no diferentes llamadas al servidor.
+        world_actors = world.get_actors()
+
+        # Guarda los actores (coches y peatones) en un array
         actors = []
-        for vehicle in world.get_actors().filter("vehicle.*"):
+        for vehicle in world_actors.filter("vehicle.*"):
             if vehicle.id == ego_actor.id:
                 continue
+            try:
+                if not vehicle.is_alive:    # Comprobar antes de llamarlo si está activo
+                    continue
+                vehicle_transform = vehicle.get_transform()
+                if near(vehicle_transform.location):
+                    vehicle_bounding_box = vehicle.bounding_box.extent
+                    actors.append({"x": vehicle_transform.location.x, "y": vehicle_transform.location.y, "yaw": vehicle_transform.rotation.yaw,
+                                   "ex": vehicle_bounding_box.x, "ey": vehicle_bounding_box.y, "kind": "vehicle"})
+            except Exception:
+                logger.warning("PrivilegedBEVGenerator: un vehículo de fondo dejo de ser valido al leerlo; se omite")
 
-            vehicle_transform = vehicle.get_transform()
-            if near(vehicle_transform.location):
-                vehicle_bounding_box = vehicle.bounding_box.extent
-                actors.append({"x": vehicle_transform.location.x, "y": vehicle_transform.location.y, "yaw": vehicle_transform.rotation.yaw,
-                               "ex": vehicle_bounding_box.x, "ey": vehicle_bounding_box.y, "kind": "vehicle"})
-
-        for pedestrian in world.get_actors().filter("walker.pedestrian.*"):
-            pedestrian_transform = pedestrian.get_transform()
-            if near(pedestrian_transform.location):
-                pedestrian_bounding_box = pedestrian.bounding_box.extent
-                actors.append({"x": pedestrian_transform.location.x, "y": pedestrian_transform.location.y, "yaw": pedestrian_transform.rotation.yaw,
-                               "ex": pedestrian_bounding_box.x, "ey": pedestrian_bounding_box.y, "kind": "pedestrian"})
+        for pedestrian in world_actors.filter("walker.pedestrian.*"):
+            try:
+                if not pedestrian.is_alive: # Comprobar antes de llamarlo si está activo
+                    continue
+                pedestrian_transform = pedestrian.get_transform()
+                if near(pedestrian_transform.location):
+                    pedestrian_bounding_box = pedestrian.bounding_box.extent
+                    actors.append({"x": pedestrian_transform.location.x, "y": pedestrian_transform.location.y, "yaw": pedestrian_transform.rotation.yaw,
+                                   "ex": pedestrian_bounding_box.x, "ey": pedestrian_bounding_box.y, "kind": "pedestrian"})
+            except Exception:
+                logger.warning("PrivilegedBEVGenerator: un peatón de fondo dejo de ser valido al leerlo; se omite")
 
         # Guarda semáforos en un array
         lights = []
-        for traffic_light in world.get_actors().filter("traffic.traffic_light*"):
-            light_transform = traffic_light.get_transform()
-            if near(light_transform.location):
-                traffic_light_state = str(traffic_light.get_state())
-                lights.append({"x": light_transform.location.x, "y": light_transform.location.y,
-                               "state": "green" if "Green" in traffic_light_state else "red"})
+        for traffic_light in world_actors.filter("traffic.traffic_light*"):
+            try:
+                if not traffic_light.is_alive:  # Comprobar antes de llamarlo si está activo
+                    continue
+                light_transform = traffic_light.get_transform()
+                if near(light_transform.location):
+                    traffic_light_state = str(traffic_light.get_state())
+                    lights.append({"x": light_transform.location.x, "y": light_transform.location.y,
+                                   "state": "green" if "Green" in traffic_light_state else "red"})
+            except Exception:
+                logger.warning("PrivilegedBEVGenerator: un semaforo dejo de ser valido al leerlo; se omite")
 
         road_quads = self._road_quads(world.get_map(), ego_location)
         route_world = [(p.x, p.y) for p in (route_pts or [])]

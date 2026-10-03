@@ -1,4 +1,7 @@
+import logging
 import math
+import time
+
 import numpy as np
 
 from .sensors import SensorSuite
@@ -9,6 +12,8 @@ from .bev_privileged import PrivilegedBEVGenerator
 from .route_tracker import RouteTracker, NUM_COMMANDS
 from .scenarios import RouteManager
 from .traffic import TrafficSpawner
+
+logger = logging.getLogger(__name__)
 
 
 def _offset_z(transform, delta: float):
@@ -93,6 +98,7 @@ class CarlaEnv:
         self._route = []            # waypoints (RouteWaypoint) de la ruta trazada
         self._last_speed = 0.0
         self._steps = 0
+        self._ego_lost = False   # se pone a True si una llamada a self.ego.* falla en pleno step()
 
         # Rutas fijas y reproducibles: las dos ramas recorren los mismos trayectos en el mismo
         # orden (ver scenarios.py). El planner se crea una vez y se reutiliza entre episodios.
@@ -158,6 +164,7 @@ class CarlaEnv:
         self._steps = 0
         self._last_steer = 0.0  # para c_steer (Think2Drive): coste al cambiar de steer
         self._was_at_junction = False   # para detectar el instante de entrar en un cruce
+        self._ego_lost = False
 
         # Sensores y métricas
         self.sensors = SensorSuite(self.world, self.ego, self.config)
@@ -182,12 +189,16 @@ class CarlaEnv:
         Returns:
             Tupla (obs, reward, done, info) estilo Gym; info incluye "route_completion",
             "deviation_meters" y "truncated" (corte por RouteSpec.max_steps).
+
+        Si una llamada a `self.ego.*` falla con una excepción Python (el ego dejó de ser un actor
+        válido a mitad de episodio), se fuerza `done=True` en vez de propagar. Previene errores
+        de CARLA no tratables.
         """
         # Realiza la acción, guardando el steer para el coste c_steer de Think2Drive
         control = self.actions.to_control(action)
         steer_changed = control.steer != self._last_steer
         self._last_steer = control.steer
-        self.ego.apply_control(self.actions.to_carla(action))
+        self._safe_ego_call(lambda: self.ego.apply_control(self.actions.to_carla(action)))
         self.world.tick()
         self._steps += 1
 
@@ -212,7 +223,7 @@ class CarlaEnv:
 
         # Corte por tiempo: sin esto un coche dando vueltas no termina nunca el episodio.
         truncated = self._steps >= int(self.route_spec.max_steps)
-        done = done or truncated
+        done = done or truncated or self._ego_lost   # ego perdido a mitad de episodio: fin forzado
 
         completion = self.tracker.completion
         # El tipo del actor impactado no es parte de la recompensa (que solo mira si hubo choque),
@@ -228,9 +239,22 @@ class CarlaEnv:
                                                  "truncated": truncated}
 
     # ---- HELPERS ----
+    def _safe_ego_call(self, fn, default=None):
+        """Ejecuta una llamada CARLA sobre `self.ego` devolviendo `default` y marcando el episodio
+        para terminar (`_ego_lost`) si el ego ya no es un actor válido.
+        """
+        try:
+            return fn()
+        except Exception:
+            logger.warning("CarlaEnv: fallo llamando a un metodo del ego, se fuerza fin de episodio")
+            self._ego_lost = True
+            return default
+
     def _speed(self) -> float:
         """Velocidad actual del ego en m/s (módulo del vector de velocidad)."""
-        v = self.ego.get_velocity()
+        v = self._safe_ego_call(self.ego.get_velocity)
+        if v is None:
+            return self._last_speed
         return math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2)
 
     def _red_light_violation(self) -> bool:
@@ -239,19 +263,24 @@ class CarlaEnv:
         Evento puntual (edge-detection sobre `is_junction`), no una condición continua: si no se
         mirase la transición, un coche parado dentro del cruce en rojo penalizaría en cada tick.
         """
-        waypoint = self.map.get_waypoint(self.ego.get_transform().location)
+        transform = self._safe_ego_call(self.ego.get_transform)
+        if transform is None:
+            return False
+        waypoint = self.map.get_waypoint(transform.location)
         at_junction = bool(waypoint and waypoint.is_junction)
         entering = at_junction and not self._was_at_junction
         self._was_at_junction = at_junction
         if not entering:
             return False
 
-        traffic_light_state = self.ego.get_traffic_light_state()
+        traffic_light_state = self._safe_ego_call(self.ego.get_traffic_light_state)
         return "Red" in str(traffic_light_state)
 
     def _update_tracker(self) -> float:
         """Pasa la pose del ego al RouteTracker y devuelve los metros de progreso del paso."""
-        transform = self.ego.get_transform()
+        transform = self._safe_ego_call(self.ego.get_transform)
+        if transform is None:
+            return 0.0
 
         return self.tracker.update(transform.location.x, transform.location.y,
                                    transform.rotation.yaw)
@@ -288,9 +317,12 @@ class CarlaEnv:
             onehot_command,
         ])
 
-        # Genera BEV privilegiado (si necesario)
+        # Genera BEV privilegiado (si necesario). Via _safe_ego_call: si el ego dejó de ser un
+        # actor válido, generate() lanza RuntimeError -> se marca _ego_lost y el episodio termina
+        # en vez de propagar.
         if self.use_privileged_bev and self.ego is not None:
-            obs["bev_privileged"] = self.bev_generator.generate(self.world, self.ego, self._route)
+            obs["bev_privileged"] = self._safe_ego_call(
+                lambda: self.bev_generator.generate(self.world, self.ego, self._route))
         else:
             obs["bev_privileged"] = None
         
@@ -314,18 +346,31 @@ class CarlaEnv:
     def _cleanup(self):
         """Destruye sensores, ego y tráfico de fondo del episodio anterior, si existen."""
         if self.sensors:
-            self.sensors.destroy(); self.sensors = None
+            self.sensors.destroy()
+        self.sensors = None
         if self.ego:
             try:
-                self.ego.destroy()
+                if self.ego.is_alive:
+                    self.ego.destroy()
             except Exception:
                 pass
             self.ego = None
         self.traffic.destroy_all()
 
     def close(self):
-        """Limpia los actores y desactiva el modo síncrono del mundo CARLA y del TrafficManager."""
+        """Limpia los actores y desactiva el modo síncrono del mundo CARLA y del TrafficManager.
+
+        Tras destruir sensores/ego/tráfico se dan unos ticks y un pequeño respiro de reloj real
+        antes de soltar la conexión en modo síncrono. `destroy()` no se aplica hasta el siguiente
+        tick y un hilo de entrega de sensor puede seguir en vuelo unos milisegundos más. No hay
+        garantía oficial de CARLA de que esto baste, pero es un margen pequeño frente al coste de
+        perder una ejecución completa. Solo aquí (cierre del entorno), no en cada `reset()`. En el
+        bucle de episodios el `world.tick()` posterior a `_cleanup()` ya da ese margen.
+        """
         self._cleanup()
+        for _ in range(3):
+            self.world.tick()
+        time.sleep(0.3)
         self.traffic.shutdown()
         settings = self.world.get_settings()
         settings.synchronous_mode = False

@@ -7,10 +7,13 @@ para no mezclar en una misma observación datos de dos frames simulados distinto
 Convención de cámaras: nombres -> transform (x, y, z, yaw) respecto al ego.
 """
 
+import logging
 import queue
 import time
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Tipos de marca vial que sí penaliza lane_invasion. Nombres de carla.LaneMarkingType.
 SOLID_LANE_MARKINGS = {"Solid", "SolidSolid"}
@@ -129,8 +132,9 @@ class SensorSuite:
             q = queue.Queue()
             self._queues[camera_name] = q
             sensor = self.world.spawn_actor(cam_bp, self._cam_transform(carla, camera_name), attach_to=self.ego)
+            self._actors.append(sensor) # Registrar el sensor antes del listen(). Si listen() falla, el destroy() del except de __init__ igual lo alcanza
+            logger.debug("SensorSuite: listen() sobre camara %s (id=%s)", camera_name, getattr(sensor, "id", "?"))
             sensor.listen(q.put)  # el callback solo encola: decodificar aqui reintroduciria la carrera
-            self._actors.append(sensor)
 
     def _setup_lidar(self, carla, bp):
         """Configuración y creación del LiDAR."""
@@ -149,37 +153,58 @@ class SensorSuite:
         q = queue.Queue()
         self._queues["lidar"] = q
         sensor = self.world.spawn_actor(lidar_bp, transform, attach_to=self.ego)
+        self._actors.append(sensor) # Registrar el sensor antes del listen(). Si listen() falla, el destroy() del except de __init__ igual lo alcanza
+        logger.debug("SensorSuite: listen() sobre lidar (id=%s)", getattr(sensor, "id", "?"))
         sensor.listen(q.put)
-        self._actors.append(sensor)
 
     def _setup_events(self, carla, bp):
         """Crea los sensores de colisión e invasión de línea."""
         # Sensor de colisión (para la función reward)
         collision_sensor = self.world.spawn_actor(bp.find("sensor.other.collision"),
                                      carla.Transform(), attach_to=self.ego)
+        self._actors.append(collision_sensor)   # Registrar el sensor antes del listen(). Si el spawn/listen del siguiente falla, este no queda huérfano
+        logger.debug("SensorSuite: listen() sobre sensor de colision (id=%s)", getattr(collision_sensor, "id", "?"))
         collision_sensor.listen(self._on_collision)
 
         # Sensor de invasión de línia (para la función reward)
         lane_sensor = self.world.spawn_actor(bp.find("sensor.other.lane_invasion"),
                                       carla.Transform(), attach_to=self.ego)
+        self._actors.append(lane_sensor)
+        logger.debug("SensorSuite: listen() sobre sensor de invasion de linea (id=%s)", getattr(lane_sensor, "id", "?"))
         lane_sensor.listen(self._on_lane_invasion)
-
-        self._actors += [collision_sensor, lane_sensor]
 
     def _on_collision(self, event):
         """Marca la colisión y clasifica el actor impactado. Si en el mismo tick hay varios
         choques se conserva el primero: el episodio termina en la colisión, así que el segundo
-        no llega a puntuar."""
-        if not self.events["collision"]:
-            self.events["collision_type"] = _collision_type(event)
-        self.events["collision"] = True
+        no llega a puntuar.
+
+        El callback corre en un hilo interno del cliente de CARLA: una excepción que escape de aquí
+        entra en el dispatcher C++ y puede provocar `std::terminate`. Se envuelve todo y, ante un
+        fallo (por ejemplo `event.other_actor` apunta a un actor ya destruido), se marca la colisión de
+        forma conservadora pero sin tipo, en vez de propagar.
+        """
+        try:
+            if not self.events["collision"]:
+                self.events["collision_type"] = _collision_type(event)
+            self.events["collision"] = True
+        except Exception:
+            self.events["collision"] = True
+            logger.warning("SensorSuite._on_collision: fallo procesando el evento, colision marcada sin tipo")
 
     def _on_lane_invasion(self, event):
         """Solo cuenta como infracción cruzar una marca continua: una discontinua es
-        un cambio de carril legal, no una infracción."""
-        marks = getattr(event, "crossed_lane_markings", [])
-        if any(_is_solid_lane_mark(mark) for mark in marks):
-            self.events["lane_invasion"] = True
+        un cambio de carril legal, no una infracción.
+
+        Mismo motivo que `_on_collision` para el `try/except`: no dejar que una excepción escape al
+        hilo del cliente de CARLA. Ante un fallo no se marca la infracción (un falso positivo
+        penalizaría de más en el Driving Score), solo se deja rastro en el log.
+        """
+        try:
+            marks = getattr(event, "crossed_lane_markings", [])
+            if any(_is_solid_lane_mark(mark) for mark in marks):
+                self.events["lane_invasion"] = True
+        except Exception:
+            logger.warning("SensorSuite._on_lane_invasion: fallo procesando el evento, se ignora")
 
     # ---- DECODIFICACIÓN ----
     @staticmethod
@@ -217,9 +242,17 @@ class SensorSuite:
             except queue.Empty:
                 raise TimeoutError(
                     f"SensorSuite: el sensor '{name}' no entrego el frame {frame} en {timeout}s")
-            if data.frame == frame:
+            # Aquí solo se blinda el consumo de frames: un `None` centinela o una lectura sin frame 
+            # legible se descarta como cualquier frame no coincidente, en vez de reventar el bucle.
+            if data is None:
+                continue
+            try:
+                frame_read = data.frame
+            except Exception:
+                continue
+            if frame_read == frame:
                 return data
-            # frame distinto del pedido (atrasado o desordenado): se descarta y se sigue buscando
+            # frame distinto del pedido (atrasado o desordenado) se descarta y se sigue buscando
 
     def get_frame(self, frame: int, timeout: float = 2.0) -> dict:
         """Observación con TODOS los sensores emparejados exactamente al mismo `frame` simulado.
@@ -256,14 +289,34 @@ class SensorSuite:
         return ev
 
     def destroy(self):
-        """Detiene y destruye todos los actores sensor creados."""
+        """Detiene y destruye todos los actores sensor creados, en dos fases con un tick de por medio.
+
+        `stop()` en todos primero, luego un `world.tick()` y solo entonces `destroy()`. Es el orden
+        que recomienda el tutorial oficial de CARLA. Sin ese tick, un `destroy()` puede pillar al
+        hilo de entrega del stream del sensor procesando un frame en vuelo sobre el actor que se
+        acaba de liberar. Esto es un bug de carrera nativa documentado (issue carla#5812) que no
+        se puede interceptar desde Python.
+        """
         for a in self._actors:
+            logger.debug("SensorSuite: stop() sobre sensor id=%s tipo=%s",
+                         getattr(a, "id", "?"), getattr(a, "type_id", "?"))
             try:
-                a.stop()
+                if a.is_alive:
+                    a.stop()
             except Exception:
                 pass
+
+        try:
+            self.world.tick()   # deja que los callbacks de stream terminen antes de destruir
+        except Exception:
+            pass
+
+        for a in self._actors:
+            logger.debug("SensorSuite: destroy() sobre sensor id=%s tipo=%s",
+                         getattr(a, "id", "?"), getattr(a, "type_id", "?"))
             try:
-                a.destroy()
+                if a.is_alive:
+                    a.destroy()
             except Exception:
                 pass
         self._actors = []

@@ -37,6 +37,7 @@ class TrafficSpawner:
         self._vehicles = []
         self._walkers = []
         self._controllers = []
+        self._world = None 
 
     def spawn(self, world, carla=None):
         """Puebla `world` con `num_vehicles` vehículos y `num_walkers` peatones.
@@ -49,6 +50,7 @@ class TrafficSpawner:
         """
         if carla is None:
             import carla
+        self._world = world
         # Seed determinista por episodio: misma semilla y mismo episodio -> mismo tráfico,
         # pase lo que pase con los spawns fallidos del episodio anterior.
         self.episode_seed = self.seed * 1000003 + self._episode
@@ -76,12 +78,19 @@ class TrafficSpawner:
                 break
             blueprint = blueprints[self._rng.randrange(len(blueprints))]
             actor = world.try_spawn_actor(blueprint, transform)
-            if actor is not None:   # punto ocupado (p.ej. por el ego): se descarta, no se reintenta
-                actor.set_autopilot(True, self.tm_port)
-                self._vehicles.append(actor)
+            if actor is not None:   # punto ocupado (p. ej. por el ego): se descarta, no se reintenta
+                self._vehicles.append(actor)   # Registrar antes de tocarlo: si set_autopilot peta, destroy_all() lo alcanza
+                try:
+                    actor.set_autopilot(True, self.tm_port)
+                except Exception:
+                    # Aqui no hay world.tick() entre spawn y esta llamada (el vehículo no ha tenido
+                    # ocasion de "morir"), así que el riesgo es mínimo. El try/except solo mantiene el
+                    # mismo patron defensivo que _spawn_walkers en todo sitio donde se toca un actor
+                    # recien creado.
+                    logger.warning("TrafficSpawner: fallo activando autopilot en un vehículo de fondo, se ignora")
 
         if len(self._vehicles) < self.num_vehicles:
-            logger.warning("TrafficSpawner: se pidieron %d vehiculos y solo se han podido crear %d "
+            logger.warning("TrafficSpawner: se pidieron %d vehículos y solo se han podido crear %d "
                             "(spawn points ocupados o insuficientes)", self.num_vehicles, len(self._vehicles))
         return self._vehicles
 
@@ -100,16 +109,26 @@ class TrafficSpawner:
                 continue
             blueprint = walker_blueprints[self._rng.randrange(len(walker_blueprints))]
             actor = world.try_spawn_actor(blueprint, carla.Transform(location))
-            if actor is not None:
+            if actor is not None:   # None = punto de navegacion ocupado, try_spawn no reintenta
                 self._walkers.append(actor)
         world.tick()
 
         controller_bp = world.get_blueprint_library().find("controller.ai.walker")
         try:
             for walker in self._walkers:
+                if not walker.is_alive:
+                    # Puede morir atropellado por el trafico de fondo (vehículos ya en autopilot) en
+                    # el world.tick() de justo arriba, antes de que le toque su controlador. Sin este
+                    # guard, spawn_actor(..., attach_to=walker) revienta con 'trying to operate on a
+                    # destroyed actor' (SIGABRT nativo, no capturable) en vez de con una excepcion
+                    # Python normal.
+                    logger.warning("TrafficSpawner: un walker murió antes de asignarle controlador, se omite")
+                    continue
+                logger.debug("TrafficSpawner: spawn_actor(controller) attach_to walker id=%s",
+                             getattr(walker, "id", "?"))
                 self._controllers.append(world.spawn_actor(controller_bp, carla.Transform(), attach_to=walker))
         except Exception:
-            logger.warning("TrafficSpawner: fallo creando un controlador de peaton a medio camino; "
+            logger.warning("TrafficSpawner: fallo creando un controlador de peatón a medio camino; "
                             "se destruyen los %d walkers y %d controladores ya creados",
                             len(self._walkers), len(self._controllers))
             for actor in self._controllers + self._walkers:
@@ -122,28 +141,87 @@ class TrafficSpawner:
         world.tick()
 
         for controller in self._controllers:
-            controller.start()
-            # Mismo guard que arriba: sin punto válido no se asigna una posicion, el
-            # controlador se queda arrancado sin destino inicial en vez de que lance
-            # go_to_location(None). La llamada real de CARLA no admite None.
-            destino = world.get_random_location_from_navigation()
-            if destino is not None:
-                controller.go_to_location(destino)
+            try:
+                # `controller.is_alive` responde por el controlador, no por su walker: entre el
+                # world.tick() de arriba y este bucle el trafico de fondo puede haber atropellado a
+                # un walker que ya tiene controlador adjunto pero aun sin arrancar. `controller.parent`
+                # es ese walker. Operar sobre un controlador cuyo walker ya murió puede reproducir el SIGABRT nativo.
+                logger.debug("TrafficSpawner: start() sobre controller id=%s (walker id=%s)",
+                             getattr(controller, "id", "?"), getattr(controller.parent, "id", "?"))
+                if controller.is_alive and (controller.parent is None or controller.parent.is_alive):
+                    controller.start()
+                    # Sin punto válido no se asigna posicion: el controlador se queda arrancado sin
+                    # destino inicial en vez de llamar a go_to_location(None), que CARLA no admite.
+                    destiny = world.get_random_location_from_navigation()
+                    if destiny is not None:
+                        controller.go_to_location(destiny)
+                elif controller.is_alive:
+                    logger.warning("TrafficSpawner: el walker de un controlador (id=%s) murió antes "
+                                    "de arrancarlo; se omite", getattr(controller, "id", "?"))
+            except Exception:
+                # No es limpieza final sino un fallo durante el episodio activo: se deja rastro
+                # en el log en vez de silenciarlo, pero un peatón no debe tumbar el reset entero.
+                logger.warning("TrafficSpawner: fallo arrancando un controlador de peatón (id=%s); "
+                                "se ignora y se continua", getattr(controller, "id", "?"))
 
         return self._walkers, self._controllers
 
     def destroy_all(self):
-        """Detiene y destruye todos los NPCs vivos (vehículos, peatones y sus controladores)."""
+        """Detiene y destruye todos los NPCs vivos (vehículos, peatones y sus controladores).
+
+        En tres fases, para no destruir un actor mientras un hilo en segundo plano del cliente de
+        CARLA (el tick del TrafficManager, la IA de un walker) todavía lo referencia. Esa carrera
+        es la que dispara el `std::terminate` / `trying to operate on a destroyed actor`.
+        
+        Etapas:
+
+        1. Desengancharlo todo del bucle vivo: `set_autopilot(False)` saca los vehículos del
+           TrafficManager; `controller.stop()` para la IA de los peatones.
+        2. Un `world.tick()`: el servidor procesa esas bajas y los hilos en vuelo terminan antes
+           de que se libere memoria.
+        3. Entonces se hace el `destroy()`.
+
+        Un walker puede además haber muerto atropellado a media escena: su controlador sigue "vivo"
+        para CARLA aunque el walker no exista, así que el guard mira `controller.parent.is_alive`
+        (el walker real). El `.destroy()` del controlador zombi se intenta igual.
+        """
+        # --- Fase 1: desenganchar del bucle vivo (sin destruir) ---
+        for vehicle in self._vehicles:
+            try:
+                if vehicle.is_alive:
+                    vehicle.set_autopilot(False, self.tm_port)
+            except Exception:
+                pass
         for controller in self._controllers:
             try:
-                controller.stop()
+                logger.debug("TrafficSpawner: stop() sobre controller id=%s (walker id=%s)",
+                             getattr(controller, "id", "?"), getattr(controller.parent, "id", "?"))
+                if controller.is_alive and (controller.parent is None or controller.parent.is_alive):
+                    controller.stop()
+                elif controller.is_alive:
+                    logger.warning("TrafficSpawner: controlador (id=%s) con walker ya muerto "
+                                    "(atropello a media escena); se omite stop() antes de destruir",
+                                    getattr(controller, "id", "?"))
+            except Exception:
+                logger.warning("TrafficSpawner: fallo en stop() de un controlador de peatón (id=%s)",
+                                getattr(controller, "id", "?"))
+
+        # --- Fase 2: tick de seguridad ---
+        if self._world is not None:
+            try:
+                self._world.tick()
             except Exception:
                 pass
+
+        # --- Fase 3: destruir ---
         for actor in self._controllers + self._walkers + self._vehicles:
             try:
-                actor.destroy()
+                if actor.is_alive:
+                    actor.destroy()
             except Exception:
-                pass
+                logger.warning("TrafficSpawner: fallo destruyendo actor id=%s tipo=%s (probablemente "
+                                "el servidor ya lo habia eliminado)",
+                                getattr(actor, "id", "?"), getattr(actor, "type_id", "?"))
         self._vehicles, self._walkers, self._controllers = [], [], []
 
     def shutdown(self):
