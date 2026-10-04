@@ -299,6 +299,7 @@ class _VideoCamera:
 
         self._frame: Optional[np.ndarray] = None
         self._lock = threading.Lock()
+        self._actor = None  # por si spawn_actor/listen fallan: destroy() no debe reventar con AttributeError
 
         bp = world.get_blueprint_library().find("sensor.camera.rgb")
         bp.set_attribute("image_size_x", str(width))
@@ -330,10 +331,12 @@ class _VideoCamera:
     def destroy(self) -> None:
         """Detiene el listener y destruye el actor sensor en CARLA."""
         try:
-            self._actor.stop()
+            if self._actor is not None and self._actor.is_alive:
+                self._actor.stop()
         except Exception:
             pass
         try:
-            self._actor.destroy()
+            if self._actor is not None and self._actor.is_alive:
+                self._actor.destroy()
         except Exception:
             pass
