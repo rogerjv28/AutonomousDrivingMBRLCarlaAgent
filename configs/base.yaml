@@ -1,55 +1,118 @@
-# Hiperparámetros comunes. Las otras configuraciones se basan en esta con `defaults: base.yaml`.
+# Hiperparámetros comunes. Las demás configuraciones parten de esta con `defaults: base.yaml`.
 seed: 0
 device: cuda
 
 carla:
   host: localhost
   port: 2000
-  town: Town10HD_Opt            # mapa CARLA v2
-  fixed_delta_seconds: 0.1      # 10 fps
-  timeout: 60.0                 # segundos para conectar/cargar el mapa
-  no_rendering: false           
-  render_offscreen: true        # renderizado activado (se necesita para las cámaras/LiDAR de los alumnos)
-  quality: Epic
-
-action:                         # Config action no efectiva, solo para visualización
-  type: discrete
-  num_actions: 39               # estilo Raw2Drive (throttle/steer/brake discretizados)
+  town: Town10HD_Opt
+  fixed_delta_seconds: 0.1      # segundos por tick (10 fps)
+  timeout: 60.0                 # segundos para conectar y cargar el mapa
+  no_rendering: false
 
 bev:
-  size: 128                     # rejilla BEV (Hb = Wb)
-  range_meters: 50.0             # cobertura; la mitad del lado del área cuadrada bev
-  channels: 7                   # canales: road, route, ego, vehicle, pedestrian, light_green, light_red
+  size: 128                     # lado de la máscara BEV privilegiada, en celdas
+  grid_size: 16                 # lado de la rejilla de features de los encoders
+  range_meters: 50.0            # medio lado del área cubierta, en metros
+  channels: 7                   # road, route, ego, vehicle, pedestrian, light_green, light_red
 
 world_model:
-  deterministic_dim: 512        # h (GRU)
-  stochastic_dim: 32            # s: 32 variables categóricas...
-  stochastic_classes: 32        # ...de 32 clases (32x32, DreamerV3)
+  deterministic_dim: 512
+  stochastic_dim: 32            # variables categóricas
+  stochastic_classes: 32        # clases por variable
   hidden_dim: 512
-  embed_dim: 256                # dim del embedding del encoder que entra al RSSM
-  num_bins: 41                  # bins two-hot para reward/critic (espacio symlog)
-  free_bits: 1.0
-  kl_balance: 0.8
+  embed_dim: 256
+  num_bins: 41                  # bins two-hot de la cabeza de reward
+  bin_min: -5.0                 # rango de esos bins, en espacio symlog
+  bin_max: 5.0
+  free_bits: 1.0                # suelo del KL por timestep, en nats
+  beta_pred: 1.0                # peso de la pérdida de predicción (recon + reward + cont)
+  beta_dyn: 1.0                 # peso de la pérdida de dinámica
+  beta_rep: 0.1                 # peso de la pérdida de representación
+  recon_class_balance: true     # da más peso a los canales BEV con pocos píxeles (road y route ocupan muchos más)
+  recon_pos_weight_decay: 0.99  # factor de la media móvil de la frecuencia de píxeles positivos por canal
+  recon_pos_weight_max: 9       # tope del peso por canal
+
+guidance:
+  beta_encoder: 10.0            # rejilla BEV, celda a celda
+  beta_deter: 5.0               # MSE del estado determinista
+  beta_stoch: 10.0              # KL(profesor || alumno) sobre el posterior categórico
+  p_teacher_fraction: 0.5       # fracción del entrenamiento en la que el profesor deja de conducir
+  distill_weight: 1.0           # peso de la CE contra las acciones del profesor
 
 policy:
-  horizon: 15                   # horizonte de imaginación
-  gamma: 0.997                  # factor de descuento y del retorno
+  horizon: 15                   # steps del horizonte de imaginación
+  gamma: 0.997
   lambda_: 0.95
-  actor_entropy: 3.0e-4         # Paso del término de entropía en la loss (pérdida) del actor
+  actor_entropy: 3.0e-4
+  return_norm_decay: 0.99
+  critic_ema_decay: 0.98
+  critic_bin_min: -10.0         # rango de los bins del critic, en symlog
+  critic_bin_max: 10.0
+
+scenarios:
+  num_train_routes: 8
+  num_eval_routes: 4            # rutas no vistas en entrenamiento
+  length_waypoints: 200         # tope por ruta (~400 m con sampling_resolution 2.0)
+  max_steps: 600                # corte del episodio, en ticks (60 s a 10 fps)
+  seed: 0                       # semilla del sorteo de origen y destino
+  sampling_resolution: 2.0      # metros entre waypoints
+  lookahead_waypoints: 20       # ventana hacia delante del RouteTracker
+  target_distance: 10.0         # distancia en metros del punto objetivo que ve la política
+
+eval:
+  seeds: 3                      # semillas por rama
+  weathers: [ClearNoon, HardRainNoon, ClearNight]
+
+traffic:
+  num_vehicles: 30
+  num_walkers: 10
+  tm_port: 8000
 
 reward:
   weight_progress: 1.0
-  weight_collision: -1.0
-  weight_infraction: -1.0
-  weight_comfort: -0.1
+  weight_deviation: -2.0
+  weight_steer: -0.5
+  weight_speed: -0.1            # por m/s de exceso sobre v_max
+  weight_collision: -25.0       # penalización fija que termina el episodio.
+  weight_infraction: -1.0       # penalizacion al cruzar marcas viales continuas
+  weight_red_light: -2.0        # penalizacion de semaforo rojo
+  weight_route_deviation: -1.0
+  weight_blocked: -1.0
+  v_max: 8.0                    # m/s, normaliza el progreso y marca el límite de r_speed
+  max_deviation_meters: 3.5     # desviación (metros) del centro del carril, por encima termina el episodio
+  blocked_seconds: 50.0         # segundos parado antes de terminar el episodio por bloqueo
 
 train:
   batch_size: 16
   seq_len: 50
   lr: 3.0e-4
+  lr_wm: 1.0e-4
+  lr_policy: 3.0e-5
+  grad_clip_wm: 1000.0          # solo con grad_clip_mode: norm
+  grad_clip_policy: 100.0       # solo con grad_clip_mode: norm
+  grad_clip_mode: agc           # agc o norm
+  agc_clip_factor: 0.3          # fracción de la norma del peso que puede alcanzar el gradiente
+  agc_eps: 1.0e-3               # suelo de la norma del peso
   amp: true
   grad_checkpoint: true
-  total_episodes: 5000        # ~1M pasos de entorno (episodios CARLA de ~200 pasos a 10fps); ajustar según GPU
-  replay_capacity: 200000
-  automatic_checkpoint_episodes: 500   # episodios entre checkpoints periódicos intermedios
+  train_ratio: 48               # updates por episodio = ceil(L * train_ratio / (batch_size * seq_len)),
+                                # con L siendo los pasos del episodio
+  prefill_episodes: 10          # episodios con política aleatoria antes del primer update
+  total_episodes: 600
+  metrics_window: 50            # episodios de la ventana móvil del resumen
+  encode_chunk_size: 64         # timesteps por bloque al codificar, bajarlo si el batch no cabe en memoria
+  replay_capacity: 100000       # steps (~50 GB de RAM con las imágenes en uint8). Un buffer grande
+                                # reduce el olvido catastrófico
+  automatic_checkpoint_episodes: 50
+  checkpoint_dir: checkpoints/  # ruta fija, sin fecha, para poder usar --resume
   log_dir: runs/
+  bev_vis_episodes: 50          # imagen del BEV real y el reconstruido cada N episodios (0 = desactivado)
+
+  video:                        # grabación de vídeos durante el entrenamiento
+    enabled: false
+    record_every_n_episodes: 50 # 0 = desactivado aunque enabled sea true
+    fps: 10
+    show_bev: false             # panel con el BEV privilegiado
+    show_decoder: false         # panel con la predicción del decoder
+    weather: ClearNoon
