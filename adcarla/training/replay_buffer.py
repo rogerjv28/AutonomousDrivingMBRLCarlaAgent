@@ -8,7 +8,14 @@ import random
 import numpy as np
 import torch
 
-_ACTION_DTYPE = {"action": torch.int64}   # acción discreta: int64 para F.one_hot; el resto → float32
+
+def normalize_sensor_value(key: str, tensor: torch.Tensor) -> torch.Tensor:
+    """Normalización de sensores compartida entre `sample()` y `RolloutAgent._batchify`.
+    `cameras` se reescala de uint8[0,255] a float32 [0,1]. El resto de claves no cambia.
+    """
+    if key == "cameras":
+        return tensor / 255.0
+    return tensor
 
 
 class SequenceReplayBuffer:
@@ -59,7 +66,10 @@ class SequenceReplayBuffer:
             device: dispositivo PyTorch de los tensores resultantes.
 
         Returns:
-            Dict de tensores [B, T, ...]. Acción dtype int64, el resto float32.
+            Dict de tensores [B, T, ...] en float32 (incluida `prev_action`, ya en one-hot).
+            `cameras` y `bev` se guardan en uint8 y aquí se convierten a float32.
+            `cameras` además se normaliza a [0, 1] dividiendo entre 255 (las demás claves ya
+            estaban en su rango natural, así que solo cambian de tipo).
 
         Raises:
             RuntimeError: si no hay episodios con longitud >= seq_len.
@@ -83,8 +93,11 @@ class SequenceReplayBuffer:
                 sequences[k].append(np.stack([step[k] for step in step_sequence], 0))  # [T, ...]
 
         # Apila las B secuencias de cada clave en un tensor [B, T, ...] listo para el modelo.
+        # cameras/bev viven en uint8 en memoria. Aquí se pasan a float32, y solo
+        # cameras se normaliza (/255) porque bev ya es {0,1}.
         batch = {}
         for k in keys:
             stacked = np.stack(sequences[k], 0)     # [B, T, ...]
-            batch[k] = torch.as_tensor(stacked, dtype=_ACTION_DTYPE.get(k, torch.float32), device=device)
+            tensor = torch.as_tensor(stacked, device=device).float()
+            batch[k] = normalize_sensor_value(k, tensor)
         return batch

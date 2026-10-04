@@ -1,208 +1,184 @@
 """Etapa 2: entrenamiento del alumno (visión o fusión) guiado por el profesor. Requiere CARLA.
 
-El profesor guía al alumno de dos formas (Raw2Drive 3.3):
-  - Rollout Guidance: MSE entre estados latentes del profesor y del alumno.
-  - Head Guidance: las cabezas de reward/cont del profesor supervisan la política del alumno.
+El profesor guía al alumno de tres formas (Raw2Drive 3.3), una por hook de `StudentTrainer`:
+  - `compute_wm_loss()`: Rollout Guidance. Compara la rejilla BEV, el estado estocástico y `h`
+    del alumno con los del profesor sobre el mismo batch. El alumno no entrena sus propias
+    cabezas reward/cont.
+  - `get_reward_fn()`, `get_cont_fn()` y `get_teacher()`: Head Guidance. La imaginación usa las
+    cabezas reward/cont del profesor y destila su política en la del alumno.
+  - `collect_policy()`: el profesor conduce cada episodio con probabilidad `p_teacher`, que
+    decae de 1 a 0 durante el entrenamiento.
 
 El alumno parte de inicialización propia (sin heredar encoder del profesor ni de la otra rama)
-para una comparativa justa. Solo el RSSM puede hacer un "warm-start" desde el profesor.
+para una comparativa justa. El RSSM (`init_rssm_from_teacher`) y el actor y el critic
+(`init_actor_critic_from_teacher`) sí pueden partir de los pesos del profesor.
 """
+import random
+
 import torch
-import torch.nn.functional as F
 
 from adcarla.carla_env.env import CarlaEnv
 from adcarla.encoders.factory import build_encoder
+from adcarla.guidance.guidance import HeadGuidance, RolloutGuidance, teacher_probability
+from adcarla.policy.factory import build_actor, build_critic
+from adcarla.training.agent import RolloutAgent, collect_episode, flatten_states
+from adcarla.training.base_trainer import BaseTrainer
 from adcarla.world_model.world_model import WorldModel
-from adcarla.policy.actor_critic import Actor, Critic
-from adcarla.policy.imagination import imagine_losses
-from adcarla.training.replay_buffer import SequenceReplayBuffer
-from adcarla.training.agent import RolloutAgent, obs_to_step, flatten_states
-from adcarla.guidance.guidance import rollout_guidance_loss, HeadGuidance
-from adcarla.utils.distributions import categorical_kl_balance
 
 
-def _load_teacher(config: dict, num_actions: int, device: str):
-    """Carga el World Model del profesor desde checkpoints/teacher.pt y congela sus pesos.
+class StudentTrainer(BaseTrainer):
+    """Entrena el world model y la política del alumno guiado por el profesor (Etapa 2)."""
 
-    Args:
-        config: configuración base (se sobreescribe el encoder a "privileged").
-        num_actions: número de acciones (debe coincidir con el checkpoint).
-        device: dispositivo donde cargar el modelo.
+    def __init__(self, config: dict, env=None, init_rssm_from_teacher: bool = True,
+                 init_actor_critic_from_teacher: bool = True):
+        """
+        Args:
+            config: configuración completa (config["branch"] identifica "vision" o "fusion").
+            env: entorno ya construido (opcional).
+            init_rssm_from_teacher: si es True, preinicializa el RSSM del alumno desde el
+                profesor para acelerar la convergencia (el encoder y las cabezas siguen siendo propios).
+            init_actor_critic_from_teacher: si es True, el actor-critic del alumno parten de
+                los pesos del profesor en vez de una inicialización aleatoria.
+        """
+        self.init_rssm_from_teacher = init_rssm_from_teacher
+        self.init_actor_critic_from_teacher = init_actor_critic_from_teacher
+        super().__init__(config, env=env)
+        guidance_config = self.config.get("guidance", {}) or {}
+        self.p_teacher_fraction = float(guidance_config["p_teacher_fraction"])
+        # Generador propio con semilla (como TrafficManager y RouteManager) que decide qué episodios
+        # conduce el profesor. Así visión y fusión coinciden en ellos y la comparación sigue siendo justa.
+        self._rng = random.Random(int(self.config.get("seed", 0)))
 
-    Returns:
-        World Model del profesor congelado y en modo eval.
-    """
-    teacher_config = {**config, "encoder": "privileged"}
-    teacher_wm = WorldModel(teacher_config, build_encoder(teacher_config), num_actions).to(device)
-    teacher_checkpoint = torch.load("checkpoints/teacher.pt", map_location=device)
-    teacher_wm.load_state_dict(teacher_checkpoint["wm"])
-    teacher_wm.eval()  # desactiva el dropout y el batch normalization
+    def _build_env(self):
+        self.config = {**self.config, "privileged_bev": True}   # target del decoder
+        return CarlaEnv(self.config)
 
-    for p in teacher_wm.parameters():
-        p.requires_grad_(False)     # congela todos los pesos: el profesor se usa solo como referencia
+    def _load_teacher(self):
+        """Carga el world model, el actor y el critic del profesor desde `train.teacher_checkpoint` y los congela.
 
-    return teacher_wm
+        El actor se usa para la recolección mixta y la destilación; el critic, para copiarlo
+        al alumno cuando `init_actor_critic_from_teacher` está activo. Los tres salen del
+        checkpoint que guarda `BaseTrainer.save_checkpoint()`.
+        """
+        checkpoint_path = self.train_config["teacher_checkpoint"]
+        teacher_config = {**self.config, "encoder": "privileged"}
+        teacher_wm = WorldModel(teacher_config, build_encoder(teacher_config), self.num_actions).to(self.device)
+        teacher_actor = build_actor(self.config, teacher_wm.rssm.feat_dim, self.num_actions).to(self.device)
+        teacher_critic = build_critic(self.config, teacher_wm.rssm.feat_dim).to(self.device)
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        if "actor" not in checkpoint:
+            raise RuntimeError(
+                f"el checkpoint del profesor ({checkpoint_path}) no trae 'actor': la recolección "
+                "mixta y la destilación necesitan la política del profesor, no solo su world model")
+        if "critic" not in checkpoint:
+            raise RuntimeError(
+                f"el checkpoint del profesor ({checkpoint_path}) no trae 'critic': "
+                "se necesita también su critic")
+        teacher_wm.load_state_dict(checkpoint["wm"])
+        teacher_actor.load_state_dict(checkpoint["actor"])
+        teacher_critic.load_state_dict(checkpoint["critic"])
+
+        for module in (teacher_wm, teacher_actor, teacher_critic):
+            module.eval()
+            for p in module.parameters():
+                p.requires_grad_(False)   # el profesor se usa solo como referencia
+        return teacher_wm, teacher_actor, teacher_critic
+
+    def _build_models(self):
+        self.teacher_wm, self.teacher_actor, self.teacher_critic = self._load_teacher()   # congelados: solo guidance
+
+        student_wm = WorldModel(self.config, build_encoder(self.config), self.num_actions).to(self.device)
+        if self.init_rssm_from_teacher:
+            student_wm.rssm.load_state_dict(self.teacher_wm.rssm.state_dict())
+
+        # Va dentro del world model del alumno para que su proyección 1x1 (si la hay) se optimice
+        # con `opt_wm` y se guarde en el checkpoint.
+        student_wm.rollout_guidance = RolloutGuidance(
+            self.config, student_wm.encoder.grid_channels, self.teacher_wm.encoder.grid_channels).to(self.device)
+
+        actor = build_actor(self.config, student_wm.rssm.feat_dim, self.num_actions).to(self.device)
+        critic = build_critic(self.config, student_wm.rssm.feat_dim).to(self.device)
+        if self.init_actor_critic_from_teacher:
+            # Las dimensiones salen de la misma configuración que el profesor, así que las
+            # arquitecturas coinciden aunque no se copie el RSSM.
+            actor.load_state_dict(self.teacher_actor.state_dict())
+            # El state_dict del critic incluye el target lento (`slow`): cargarlo entero evita que
+            # `slow` siga siendo una copia de la red aleatoria mientras `net` ya es la del profesor.
+            critic.load_state_dict(self.teacher_critic.state_dict())
+        self.head_guidance = HeadGuidance(self.config, self.teacher_wm, self.teacher_actor)
+        agent = RolloutAgent(student_wm, actor, self.config, self.device)
+        # El profesor necesita el BEV privilegiado para conducir. El entorno lo sigue
+        # entregando (`privileged_bev` en `_build_env`).
+        self.teacher_agent = RolloutAgent(self.teacher_wm, self.teacher_actor, self.config, self.device)
+        return student_wm, actor, critic, agent
+
+    def compute_wm_loss(self, batch: dict):
+        """World model del alumno (solo recon+kl) + Rollout Guidance contra el profesor congelado."""
+        aux = {}   # `WorldModel.loss` guarda aquí la rejilla BEV y los logits posteriores del alumno
+        wm_loss, states, metrics = self.wm.loss(batch, terms=("recon", "kl"), aux=aux)
+
+        with torch.no_grad():
+            teacher_embed, teacher_grid = self.teacher_wm._encode_seq(batch, with_grid=True)
+            # El profesor no muestrea, usa la muestra del alumno en cada paso.
+            # Así los tres términos comparan estados y no ruido de muestreo.
+            teacher_states, teacher_post, _, _ = self.teacher_wm.rssm.observe(
+                teacher_embed, batch["prev_action"], stoch_override=states["stoch"])
+
+        # La imaginación arranca de `flatten_states(states)`: el profesor debe arrancar de su
+        # propio estado en esos mismos instantes para avanzar en paralelo con el alumno.
+        self.head_guidance.reset(flatten_states(teacher_states))
+
+        guidance_loss, guidance_metrics = self.wm.rollout_guidance(
+            student={"grid": aux["bev_grid"], "post_logits": aux["post_logits"], "h": states["h"]},
+            teacher={"grid": teacher_grid, "post_logits": teacher_post, "h": teacher_states["h"]})
+
+        metrics.update(guidance_metrics)
+        total_loss = wm_loss + guidance_loss
+        metrics["loss"] = total_loss.item()
+        return total_loss, states, metrics
+
+    def get_reward_fn(self):
+        return self.head_guidance.reward_fn
+
+    def get_cont_fn(self):
+        return self.head_guidance.cont_fn
+
+    def get_teacher(self):
+        """Solo es válido tras `compute_wm_loss()`, que hace el `reset()` con el estado del
+        profesor del batch en curso. El bucle de `BaseTrainer` los llama en ese orden."""
+        return self.head_guidance
+
+    def collect_policy(self, episode: int) -> int:
+        """Recoge un episodio conduciendo el profesor con probabilidad `p_teacher`.
+
+        Args:
+            episode: episodio actual. `p_teacher` decae linealmente de 1 a 0 con él.
+
+        Returns:
+            Pasos actuados en el episodio (los cuenta `collect_episode`).
+        """
+        p_teacher = teacher_probability(episode, int(self.train_config["total_episodes"]),
+                                        self.p_teacher_fraction)
+        agent = self.teacher_agent if self._rng.random() < p_teacher else self.agent
+        return collect_episode(self.env, agent, self.buffer, self.config, self.num_actions, greedy=False)
 
 
-def train_student(config: dict, init_rssm_from_teacher: bool = True):
-    """Entrena el world model y la política del alumno guiado por el profesor.
+def train_student(config: dict, resume: bool = False, init_rssm_from_teacher: bool = True,
+                   init_actor_critic_from_teacher: bool = True):
+    """Punto de entrada de scripts/train_student.py.
 
     Args:
         config: configuración completa (ver configs/student_vision.yaml o student_fusion.yaml).
-            config["branch"] identifica la rama ("vision" o "fusion").
-        init_rssm_from_teacher: si es True, preinicializa el RSSM del alumno desde el profesor
-            para acelerar la convergencia (los encoders y heads siguen siendo propios).
+        resume: si es True, reanuda desde el último checkpoint guardado. Los pesos del checkpoint
+            sustituyen a los copiados del profesor, porque se cargan después de construir los modelos.
+        init_rssm_from_teacher: si es True, el RSSM del alumno parte de los pesos del profesor.
+        init_actor_critic_from_teacher: si es True, el actor y el critic del alumno parten de los del profesor.
 
     Returns:
-        Tupla (student, actor). Guarda checkpoints/student_{branch}.pt.
+        Tupla (student_wm, actor) con los módulos entrenados.
     """
-    device = config.get("device", "cpu")
-    config = {**config, "privileged_bev": True}   # el entorno CARLA provee la máscara BEV privilegiada como target del decoder
-    train_config = config["train"]
-
-    # --- Inicialización ---
-    env = CarlaEnv(config)
-    num_actions = env.actions.n
-    teacher_wm = _load_teacher(config, num_actions, device)   # congelado: solo para guidance
-
-    student_wm = WorldModel(config, build_encoder(config), num_actions).to(device)
-    if init_rssm_from_teacher:
-        # Preinicialización de la dinámica temporal, el encoder (la variable a comparar) es propio
-        student_wm.rssm.load_state_dict(teacher_wm.rssm.state_dict())
-
-    actor  = Actor(student_wm.rssm.feat_dim, num_actions).to(device)
-    critic = Critic(student_wm.rssm.feat_dim, int(config["world_model"]["num_bins"])).to(device)
-    head_guidance = HeadGuidance(teacher_wm)   # envuelve reward/cont del profesor como callables
-
-    buffer = SequenceReplayBuffer(int(train_config["replay_capacity"]), int(train_config["seq_len"]))
-    agent  = RolloutAgent(student_wm, actor, config, device)
-
-    # Optimizadores separados: actor_loss no puede actualizar critic.net (ni viceversa)
-    opt_wm    = torch.optim.Adam(student_wm.parameters(), lr=float(train_config["lr"]))
-    opt_actor  = torch.optim.Adam(actor.parameters(),  lr=float(train_config["lr"]))
-    opt_critic = torch.optim.Adam(critic.parameters(), lr=float(train_config["lr"]))
-
-    # Ponemos los tres módulos del agente estudiante en modo train antes de entrenar.
-    student_wm.train()
-    actor.train()
-    critic.train()
-
-    # --- Bucle de entrenamiento ---
-    episode = 0  # inicialización
-    try:
-        for episode in range(int(train_config["total_episodes"])):
-
-            observation = env.reset()
-            agent.reset()
-            done = False
-
-            # Recopilamos información del episodio con los sensores del alumno
-            while not done:
-                action = agent.act(observation, greedy=False)
-                next_obs, reward, done, _ = env.step(action)
-                step_data = obs_to_step(observation, config)
-                step_data.update(action=action, reward=reward, cont=0.0 if done else 1.0)
-                buffer.add_step(step_data)
-                observation = next_obs
-
-            buffer.end_episode()
-
-            if not buffer.can_sample():
-                continue
-
-            batch = buffer.sample(int(train_config["batch_size"]), device)
-            B, T = batch["action"].shape[:2]
-            action_onehot = F.one_hot(batch["action"].long(), num_actions).float()  # [B, T, num_actions]
-
-            # --- World Model del alumno: recon + KL + Rollout Guidance ---
-            student_embed = student_wm._encode_seq(batch)          # [B, T, embed_dim]
-            student_states, post_logits, prior_logits, _ = student_wm.rssm.observe(student_embed, action_onehot)
-            student_feat = student_wm.rssm.feat(student_states)    # [B, T, feat_dim]
-
-            # Reconstrucción BEV: aplana (B,T) para el decoder convolucional y recupera la forma
-            bev_recon = student_wm.decoder(student_feat.reshape(B * T, -1)).reshape(
-                B, T, student_wm.bev_channels, student_wm.size, student_wm.size)
-            recon_loss = F.binary_cross_entropy(bev_recon, batch["bev"])
-
-            kl_loss = categorical_kl_balance(post_logits, prior_logits, student_wm.free_bits, student_wm.kl_balance).mean()
-
-            # Rollout Guidance: MSE entre estados latentes, el estado del profesor se evalúa congelado
-            with torch.no_grad():
-                teacher_embed = teacher_wm._encode_seq(batch)
-                teacher_states, _, _, _ = teacher_wm.rssm.observe(teacher_embed, action_onehot)
-            guidance_loss = rollout_guidance_loss(teacher_states, student_states)
-
-            # Las cabezas reward/cont del alumno se omiten intencionalmente (Raw2Drive Seccion 3.3):
-            # entrenarlas con sensores brutos causa divergencia porque los frames adyacentes son muy
-            # similares mientras reward/cont fluctúan abruptamente. El Head Guidance usa las cabezas
-            # estables del profesor como señal de supervisión. En inferencia, el alumno solo necesita
-            # su propio actor (ya entrenado), las cabezas reward/cont no se usan en producción.
-            wm_loss = recon_loss + kl_loss + guidance_loss
-
-            # Borra gradientes antiguos, propaga la perdida hacia atras y actualiza los pesos
-            opt_wm.zero_grad()
-            wm_loss.backward()
-            torch.nn.utils.clip_grad_norm_(student_wm.parameters(), max_norm=1000.0)  # DreamerV3: previene gradientes muy altos en secuencias largas
-            opt_wm.step()
-
-            # --- Actor-Critic por imaginación con Head Guidance ---
-            # Las cabezas del profesor (head_guidance) estiman reward/cont sobre los estados del alumno
-            start = flatten_states(student_states)      # [B*T, dim] desconectado
-            actor_loss, critic_loss, policy_metrics = imagine_losses(
-                student_wm.rssm, actor, critic, start, head_guidance.reward_fn, head_guidance.cont_fn, config)
-
-            # Actor
-            # Borra gradientes antiguos, propaga la perdida hacia atras y actualiza los pesos
-            opt_actor.zero_grad()
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=1000.0)
-            opt_actor.step()
-
-            # Critic
-            # Borra gradientes antiguos, propaga la perdida hacia atras y actualiza los pesos
-            opt_critic.zero_grad()
-            critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1000.0)
-            opt_critic.step()
-
-            if episode % 50 == 0:
-                branch = config.get('branch', 'x')
-                print(
-                    f"[student-{branch} ep={episode}] "
-                    f"wm={wm_loss.item():.3f} recon={recon_loss.item():.3f} "
-                    f"kl={kl_loss.item():.3f} guid={guidance_loss.item():.3f} | "
-                    f"actor={policy_metrics['actor_loss']:.3f} critic={policy_metrics['critic_loss']:.3f} "
-                    f"entropy={policy_metrics['entropy']:.3f} return={policy_metrics['return']:.2f}"
-                )
-
-            # Checkpoint periódico: permite reanudar el entrenamiento si se interrumpe
-            automatic_checkpoint_episodes = int(train_config.get("automatic_checkpoint_episodes", 500))
-            if episode > 0 and episode % automatic_checkpoint_episodes == 0:
-                branch = config.get('branch', 'x')
-                torch.save({
-                    "episode": episode,
-                    "wm": student_wm.state_dict(),
-                    "actor": actor.state_dict(),
-                    "critic": critic.state_dict(),
-                    "opt_wm": opt_wm.state_dict(),
-                    "opt_actor": opt_actor.state_dict(),
-                    "opt_critic": opt_critic.state_dict(),
-                    "config": config,
-                }, f"checkpoints/student_{branch}_ep{episode}.pt")
-
-        branch = config.get('branch', 'x')
-        # Guarda pesos, optimizadores, episodio actual y config para poder reanudar el entrenamiento
-        torch.save({
-            "episode": episode,
-            "wm": student_wm.state_dict(),
-            "actor": actor.state_dict(),
-            "critic": critic.state_dict(),
-            "opt_wm": opt_wm.state_dict(),
-            "opt_actor": opt_actor.state_dict(),
-            "opt_critic": opt_critic.state_dict(),
-            "config": config,
-        }, f"checkpoints/student_{branch}.pt")
-
-    finally:
-        env.close()
-    return student_wm, actor
+    trainer = StudentTrainer(config, init_rssm_from_teacher=init_rssm_from_teacher,
+                              init_actor_critic_from_teacher=init_actor_critic_from_teacher)
+    trainer.train(resume=resume)
+    return trainer.wm, trainer.actor
