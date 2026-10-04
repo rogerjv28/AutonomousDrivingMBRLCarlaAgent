@@ -1,3 +1,9 @@
 defaults: base.yaml
 name: teacher
-encoder: privileged     # entrada = máscara BEV semántica (Etapa 1)
+encoder: privileged     # la entrada es la máscara BEV semántica privilegiada
+
+carla:
+  no_rendering: true    # el profesor no lee cámaras
+
+train:
+  grad_checkpoint: false

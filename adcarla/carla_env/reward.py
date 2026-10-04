@@ -45,16 +45,11 @@ class RewardFunction:
         # el episodio (Roach sí lo termina).
         self.weight_red_light = reward_config.get("weight_red_light", -2.0)
 
-        # Colisión proporcional a la velocidad de impacto (Roach Ap. C.1), con
-        # tope para que un choque a gran velocidad no desborde el resto de la recompensa.
-        self.collision_speed_cap = float(reward_config.get("collision_speed_cap", 10.0))
-
     def __call__(self, signals: dict):
         """Calcula reward/done/info a partir de señales ya extraídas del simulador.
 
         Args:
             signals: dict con progress_meters (float), speed (float, m/s), collision (bool),
-                impact_speed (float, m/s, velocidad del tick anterior al choque, por defecto speed),
                 infraction (bool, solo marcas continuas), steer_changed (bool), route_done (bool),
                 deviation_meters (float), max_deviation_meters (float), blocked (bool),
                 red_light_violation (bool).
@@ -65,9 +60,6 @@ class RewardFunction:
         """
         progress = float(signals.get("progress_meters", 0.0))
         speed = float(signals.get("speed", 0.0))
-        # Roach penaliza con la velocidad de LLEGADA al impacto, el tick del choque ya ha frenado
-        # el coche, asi que `speed` subestima el golpe. El entorno pasa la del tick anterior.
-        impact_speed = float(signals.get("impact_speed", speed))
         collision = bool(signals.get("collision", False))
         infraction = bool(signals.get("infraction", False))
         steer_changed = bool(signals.get("steer_changed", False))
@@ -108,8 +100,10 @@ class RewardFunction:
         if blocked:
             reward += self.weight_blocked
         if collision:
-            # Terminal -(1+min(s, tope)) de Roach: cuanto más rápido el impacto, más penaliza.
-            reward += self.weight_collision * (1.0 + min(impact_speed, self.collision_speed_cap))
+            # Penalización terminal fija de Raw2Drive (Fig. 9, ≈-100), no escalada por velocidad de
+            # impacto como el -(1+min(s,tope)) de Roach: con Roach el máximo (~-11) pesaba poco
+            # frente a cientos de ticks de weight_deviation/weight_steer acumulados.
+            reward += self.weight_collision
 
         done = collision or route_done or route_deviation or blocked
         info = {"collision": collision, "infraction": infraction, "route_done": route_done,
