@@ -69,6 +69,18 @@ class WorldModel(nn.Module):
                                                 float(wm_config["bin_min"]),
                                                 float(wm_config["bin_max"])))  # bins two-hot fijos (D6)
 
+        # Compensación del desbalance entre canales en la BCE de reconstrucción: road y route
+        # ocupan muchos más píxeles que vehicle, pedestrian y light_*. Sin ponderar, la pérdida
+        # baja casi del todo prediciendo "nada" en esos canales con pocos píxeles.
+        self.recon_class_balance = bool(wm_config.get("recon_class_balance", False))
+        self.recon_pos_weight_decay = float(wm_config.get("recon_pos_weight_decay", 0.99))
+        self.recon_pos_weight_max = float(wm_config.get("recon_pos_weight_max", 50.0))
+        # Media móvil exponencial de la fracción de píxeles positivos por canal del BEV, con la
+        # que se calcula pos_weight = (1 - f) / f. Arranca en 0.5 (pos_weight = 1, sin sesgo)
+        # hasta tener datos reales. No es persistente: se recalcula en unos cientos de updates
+        # y así los checkpoints se cargan igual con o sin esta clave.
+        self.register_buffer("recon_pos_freq", torch.full((self.bev_channels,), 0.5), persistent=False)
+
         train_config = config.get("train", {})
         self.grad_checkpoint = bool(train_config.get("grad_checkpoint", False))
         self.amp = bool(train_config.get("amp", False))
@@ -177,10 +189,24 @@ class WorldModel(nn.Module):
             if "recon" in terms:
                 feat_flat = feat.reshape(B * T, -1)
                 recon = self.decoder(feat_flat).reshape(B, T, self.bev_channels, self.size, self.size)
-                # Log-verosimilitud (DreamerV3 Ec. 2): suma sobre [C, H, W].
-                recon_loss = F.binary_cross_entropy_with_logits(recon, batch["bev"], reduction="none").sum([2, 3, 4])
+
+                pos_weight = None
+                if self.recon_class_balance:
+                    with torch.no_grad():
+                        batch_freq = batch["bev"].float().mean(dim=(0, 1, 3, 4))   # [C], frecuencia en este batch
+                        self.recon_pos_freq.mul_(self.recon_pos_weight_decay).add_(
+                            batch_freq, alpha=1.0 - self.recon_pos_weight_decay)
+                        freq = self.recon_pos_freq.clamp(min=1.0 / self.recon_pos_weight_max)
+                        pos_weight = ((1.0 - freq) / freq).clamp(max=self.recon_pos_weight_max)
+                        pos_weight = pos_weight.view(1, 1, self.bev_channels, 1, 1)
+
+                recon_loss = F.binary_cross_entropy_with_logits(
+                    recon, batch["bev"], pos_weight=pos_weight, reduction="none"
+                ).sum([2, 3, 4])
                 total = total + self.beta_pred * recon_loss
                 metrics["recon"] = recon_loss.mean().item()
+                if pos_weight is not None:
+                    metrics["recon_pos_weight_mean"] = pos_weight.mean().item()
 
             if "reward" in terms:
                 reward_loss = two_hot_loss(self.reward(feat), batch["reward"], self.bins)
